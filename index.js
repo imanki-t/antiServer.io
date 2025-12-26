@@ -159,12 +159,18 @@ async function sendPlayerMessage(username, message) {
   if (username === botOptions.username || !MESSAGE_WEBHOOK) return;
   try {
     await axios.post(MESSAGE_WEBHOOK, {
-      embeds: [{ author: { name: username }, description: message, color: SUCCESS_EMBED_COLOR, timestamp: new Date().toISOString() }],
+      embeds: [{ 
+        author: { name: username }, 
+        description: message, 
+        color: CHAT_EMBED_COLOR, // ✅ Updated to Norwegian Blue
+        timestamp: new Date().toISOString() 
+      }],
     });
   } catch (err) {
     console.error('❌ Message Webhook Error:', err.message);
   }
 }
+
 
 function getOnlinePlayersExcludingBot() {
   if (!bot || !bot.players || !isBotOnline) {
