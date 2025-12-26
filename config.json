@@ -14,7 +14,7 @@
     "port": 3000
   },
   "database": {
-    "mongoUri": "mongodb+srv://ankitdabutter:OEbjmZiJJj7Z5sb2@cluster0.6grcc.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+    "mongoUri": ""
   },
   "intervals": {
     "movement": 5000,
