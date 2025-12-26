@@ -32,7 +32,8 @@
     "success": 65280,
     "warning": 16750848,
     "error": 16711680,
-    "info": 10181046
+    "info": 10181046,
+    "chat": 6919834
   },
   "faces": [
     "steve.png",
@@ -49,4 +50,4 @@
     "antiAFK": true,
     "autoRejoin": true
   }
-      }
+}
