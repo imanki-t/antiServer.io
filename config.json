@@ -1,0 +1,52 @@
+{
+  "bot": {
+    "host": "Leafsong.aternos.me",
+    "port": 36915,
+    "username": "Leaf",
+    "version": "1.21"
+  },
+  "webhooks": {
+    "discord": "",
+    "chat": "",
+    "message": ""
+  },
+  "server": {
+    "port": 3000
+  },
+  "database": {
+    "mongoUri": "mongodb://localhost:27017/minecraft_dashboard"
+  },
+  "intervals": {
+    "movement": 5000,
+    "look": 3000,
+    "reconnect": 3000,
+    "socketUpdate": 1000,
+    "activityCheck": 5000
+  },
+  "timeLimits": {
+    "oneHour": 3600000,
+    "fifteenSeconds": 5000
+  },
+  "embedColors": {
+    "default": 3447003,
+    "success": 65280,
+    "warning": 16750848,
+    "error": 16711680,
+    "info": 10181046
+  },
+  "faces": [
+    "steve.png",
+    "alex.png",
+    "lucy.png",
+    "ken.png",
+    "burrito.png",
+    "kaji.png",
+    "rusty.png",
+    "doon.png"
+  ],
+  "features": {
+    "autoTimeFreeze": true,
+    "antiAFK": true,
+    "autoRejoin": true
+  }
+      }
