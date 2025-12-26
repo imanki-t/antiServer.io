@@ -46,6 +46,8 @@ const SUCCESS_EMBED_COLOR = config.embedColors.success;
 const WARNING_EMBED_COLOR = config.embedColors.warning;
 const ERROR_EMBED_COLOR = config.embedColors.error;
 const INFO_EMBED_COLOR = config.embedColors.info;
+const CHAT_EMBED_COLOR = config.embedColors.chat; // Removed the fallback
+
 
 const FACES = config.faces;
 
