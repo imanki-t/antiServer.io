@@ -73,7 +73,6 @@ let lastOnlineTime = null;
 let currentServerHost = BOT_HOST;
 let currentServerPort = BOT_PORT;
 let lastCpuUsage = process.cpuUsage();
-let lastCpuTime = process.hrtime.bigint();
 let nextDotFaceIndex = 0;
 let isTimeFrozen = false;
 let otherPlayersOnline = 0;
@@ -124,10 +123,18 @@ function clearAllIntervals() {
   }
 }
 
+// Reset state strictly to avoid fake data
+function resetBotState() {
+  isBotOnline = false;
+  botStartTime = null;
+  movementCount = 0;
+  isTimeFrozen = false;
+  otherPlayersOnline = 0;
+  // Note: We do NOT reset lastOnlineTime so the dashboard knows when it was last seen
+}
+
 async function sendDiscordEmbed(title, description, color = DEFAULT_EMBED_COLOR, fields = []) {
-  if (!DISCORD_WEBHOOK) {
-    return;
-  }
+  if (!DISCORD_WEBHOOK) return;
   try {
     await axios.post(DISCORD_WEBHOOK, {
       embeds: [{ title, description, color, fields, timestamp: new Date().toISOString() }],
@@ -138,9 +145,7 @@ async function sendDiscordEmbed(title, description, color = DEFAULT_EMBED_COLOR,
 }
 
 async function sendChatEmbed(title, description, color = SUCCESS_EMBED_COLOR, fields = []) {
-  if (!CHAT_WEBHOOK) {
-    return;
-  }
+  if (!CHAT_WEBHOOK) return;
   try {
     await axios.post(CHAT_WEBHOOK, {
       embeds: [{ title, description, color, fields, timestamp: new Date().toISOString() }],
@@ -151,9 +156,7 @@ async function sendChatEmbed(title, description, color = SUCCESS_EMBED_COLOR, fi
 }
 
 async function sendPlayerMessage(username, message) {
-  if (username === botOptions.username || !MESSAGE_WEBHOOK) {
-    return;
-  }
+  if (username === botOptions.username || !MESSAGE_WEBHOOK) return;
   try {
     await axios.post(MESSAGE_WEBHOOK, {
       embeds: [{ author: { name: username }, description: message, color: SUCCESS_EMBED_COLOR, timestamp: new Date().toISOString() }],
@@ -164,7 +167,7 @@ async function sendPlayerMessage(username, message) {
 }
 
 function getOnlinePlayersExcludingBot() {
-  if (!bot || !bot.players) {
+  if (!bot || !bot.players || !isBotOnline) {
     return [];
   }
   return Object.values(bot.players).filter(p => p.username !== botOptions.username);
@@ -172,9 +175,7 @@ function getOnlinePlayersExcludingBot() {
 
 // Time freeze/unfreeze functions
 async function freezeTime() {
-  if (!bot || !isBotOnline || isTimeFrozen) {
-    return;
-  }
+  if (!bot || !isBotOnline || isTimeFrozen) return;
   try {
     bot.chat('/tick freeze');
     isTimeFrozen = true;
@@ -186,9 +187,7 @@ async function freezeTime() {
 }
 
 async function unfreezeTime() {
-  if (!bot || !isBotOnline || !isTimeFrozen) {
-    return;
-  }
+  if (!bot || !isBotOnline || !isTimeFrozen) return;
   try {
     bot.chat('/tick unfreeze');
     isTimeFrozen = false;
@@ -205,7 +204,7 @@ async function ensureTimeUnfrozen() {
       bot.chat('/tick unfreeze');
       isTimeFrozen = false;
       console.log('✅ Time unfrozen before disconnect');
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for command to execute
+      await new Promise(resolve => setTimeout(resolve, 1000));
     } catch (err) {
       console.error('❌ Error ensuring time unfrozen:', err.message);
     }
@@ -213,60 +212,39 @@ async function ensureTimeUnfrozen() {
 }
 
 function checkPlayerCount() {
-  if (!bot || !AUTO_TIME_FREEZE) {
-    return;
-  }
+  if (!bot || !AUTO_TIME_FREEZE || !isBotOnline) return;
 
   const players = getOnlinePlayersExcludingBot();
   otherPlayersOnline = players.length;
 
   if (otherPlayersOnline === 0 && !isTimeFrozen) {
-    // Bot is alone, freeze time
-    setTimeout(() => freezeTime(), 2000); // Small delay to ensure player count is accurate
+    setTimeout(() => freezeTime(), 2000);
   } else if (otherPlayersOnline > 0 && isTimeFrozen) {
-    // Other players joined, unfreeze time
     unfreezeTime();
   }
 }
 
 function sendPlayerList() {
-  if (!bot || !bot.players) {
-    return;
-  }
-  try {
-    const playersExcludingBot = getOnlinePlayersExcludingBot();
-
-    if (playersExcludingBot.length === 0) {
-      return;
-    }
-
-    const fields = playersExcludingBot.map(player => ({
-      name: player.username,
-      value: `In Range: ${player.entity ? 'Yes' : 'No'}`,
-      inline: true
-    }));
-  } catch (err) {
-    console.error('❌ Error sending player list:', err.message);
-  }
+  if (!bot || !bot.players || !isBotOnline) return;
+  // Logic kept for potential Discord updates, but simplified
 }
 
 function sendBotStats() {
-  if (!bot || !bot.entity) {
-    return;
-  }
+  if (!bot || !isBotOnline) return;
   try {
     const uptime = botStartTime ? Math.floor((Date.now() - botStartTime) / 1000) : 0;
     const hours = Math.floor(uptime / 3600);
     const minutes = Math.floor((uptime % 3600) / 60);
     const seconds = uptime % 60;
     const uptimeStr = `${hours}h ${minutes}m ${seconds}s`;
-    const position = bot.entity.position;
+    
+    // Safety check for entity
+    const position = bot.entity ? bot.entity.position : { x: 0, y: 0, z: 0 };
     const posStr = `X: ${Math.floor(position.x)}, Y: ${Math.floor(position.y)}, Z: ${Math.floor(position.z)}`;
+    
     const memoryUsage = process.memoryUsage();
     const memoryStr = `${Math.round(memoryUsage.rss / 1024 / 1024 * 100) / 100} MB`;
-    
     const gameModeDisplay = bot?.game?.gameMode || 'N/A';
-
     const onlinePlayersCount = getOnlinePlayersExcludingBot().length;
 
     sendDiscordEmbed('Bot Status Report', `Status report for ${botOptions.username}`, INFO_EMBED_COLOR, [
@@ -285,14 +263,46 @@ function sendBotStats() {
 }
 
 function performMovement() {
-  if (!bot || !bot.entity) {
-    return;
-  }
+  if (!bot || !bot.entity || !isBotOnline) return;
   try {
-    const currentPos = bot.entity.position;
-    const targetX = currentPos.x + (Math.random() * 10 - 5);
-    const targetZ = currentPos.z + (Math.random() * 10 - 5);
-    bot.entity.position.set(targetX, currentPos.y, targetZ);
+    // 1. Random look direction (Simulates a human looking around)
+    const yaw = Math.random() * Math.PI * 2;
+    const pitch = (Math.random() * Math.PI / 2) - (Math.PI / 4);
+    bot.look(yaw, pitch);
+
+    const randomAction = Math.random();
+
+    // 2. Action Logic
+    if (randomAction < 0.4) {
+        // 40% Chance: Walk briefly (Simulate small movements)
+        bot.setControlState('forward', true);
+        
+        // 10% Chance: Jump while walking (to clear 1-block obstacles)
+        if (Math.random() < 0.25) {
+            bot.setControlState('jump', true);
+        }
+
+        // Stop after 0.5 - 1 second to avoid walking into danger
+        // This is the "Safety Walk" feature
+        const duration = 500 + Math.random() * 500; 
+        setTimeout(() => {
+            if (bot) {
+                bot.clearControlStates(); // Stops walking and jumping
+            }
+        }, duration);
+
+    } else if (randomAction < 0.7) {
+        // 30% Chance: Jump in place (Classic AFK behavior)
+        bot.setControlState('jump', true);
+        setTimeout(() => {
+            if (bot) bot.setControlState('jump', false);
+        }, 500);
+
+    } else {
+        // 30% Chance: Just swing arm
+        bot.swingArm('right');
+    }
+
     movementCount++;
   } catch (err) {
     console.error('❌ Movement error:', err.message);
@@ -300,9 +310,7 @@ function performMovement() {
 }
 
 function lookAround() {
-  if (!bot || !bot.entity) {
-    return;
-  }
+  if (!bot || !bot.entity || !isBotOnline) return;
   try {
     const yaw = Math.random() * Math.PI * 2;
     const pitch = (Math.random() * Math.PI / 3) - (Math.PI / 6);
@@ -321,20 +329,16 @@ function setupIntervals() {
   }, ACTIVITY_CHECK_INTERVAL);
   setTimeout(sendPlayerList, 5000);
   setTimeout(sendBotStats, 10000);
-  setTimeout(checkPlayerCount, 3000); // Check player count after spawn
+  setTimeout(checkPlayerCount, 3000);
 }
 
 function checkBotActivity() {
-  if (!botStartTime || !isBotOnline || !ANTI_AFK) {
-    return;
-  }
+  if (!botStartTime || !isBotOnline || !ANTI_AFK) return;
 
   const uptime = Date.now() - botStartTime;
-
   if (uptime >= ONE_HOUR) {
     sendDiscordEmbed('Bot Activity', 'Bot active for over 1 hour. Rejoining to prevent AFK detection.', WARNING_EMBED_COLOR);
     forceRejoinBot();
-    botStartTime = null;
     return;
   }
 }
@@ -359,14 +363,15 @@ async function getOrCreatePlayerFace(username, uuid) {
       skinUrl = `./${selectedFace}`;
     } else {
       try {
-        const crafatarResponse = await axios.get(`https://crafatar.com/avatars/${uuid}?size=32&overlay`, { responseType: 'arraybuffer' });
+        // Only try crafatar if we have a UUID or it's a real player name (not starting with .)
+        const faceUrl = uuid ? `https://crafatar.com/avatars/${uuid}?size=32&overlay` : `https://crafatar.com/avatars/${username}?size=32&overlay`; // Fallback to username for crafatar if uuid missing
+        const crafatarResponse = await axios.get(faceUrl, { responseType: 'arraybuffer' });
+        
         if (crafatarResponse.status === 200) {
-          skinUrl = `https://crafatar.com/avatars/${uuid}?size=32&overlay`;
+          skinUrl = faceUrl;
           playerFace = new PlayerFace({ username: username, face: skinUrl, isCustom: true });
         } else {
-          const selectedFace = FACES[Math.floor(Math.random() * FACES.length)];
-          skinUrl = `./${selectedFace}`;
-          playerFace = new PlayerFace({ username: username, face: selectedFace, isCustom: false });
+          throw new Error("Face not found");
         }
       } catch (crafatarError) {
         const selectedFace = FACES[Math.floor(Math.random() * FACES.length)];
@@ -393,10 +398,8 @@ function startBot() {
     bot = null;
   }
 
-  botStartTime = null;
-  movementCount = 0;
-  isBotOnline = false;
-  isTimeFrozen = false;
+  // Reset state on start attempt
+  resetBotState();
 
   console.log(`🚀 Starting bot with version ${BOT_VERSION}...`);
   bot = mineflayer.createBot(botOptions);
@@ -408,10 +411,25 @@ function startBot() {
     lastOnlineTime = Date.now();
     console.log(`✅ Bot spawned successfully on ${BOT_HOST}:${BOT_PORT}`);
 
+    // Safe socket keepalive
     if (bot._client && bot._client.socket) {
       bot._client.socket.setKeepAlive(true, 30000);
     }
     
+    // Move the player_info listener here to ensure _client exists
+    if (bot._client) {
+      bot._client.on('player_info', (packet) => {
+        packet.data.forEach((player) => {
+          if (player.uuid === bot.uuid) {
+            const gamemodeMap = { 0: 'Survival', 1: 'Creative', 2: 'Adventure', 3: 'Spectator' };
+            const currentGamemode = gamemodeMap[player.gamemode] || 'Unknown';
+            bot.game = bot.game || {};
+            bot.game.gameMode = currentGamemode;
+          }
+        });
+      });
+    }
+
     setTimeout(() => {
       setupIntervals();
     }, 1000);
@@ -421,12 +439,13 @@ function startBot() {
     console.error('❌ Bot Error:', err.message);
     sendDiscordEmbed('Bot Error', `Error: ${err.message}`, ERROR_EMBED_COLOR);
 
-    // Only reconnect on connection errors, not on game errors
     if (err.message.includes("timed out") ||
         err.message.includes("ECONNRESET") ||
         err.message.includes("ECONNREFUSED") ||
         err.name === 'PartialReadError' ||
         err.message.includes("Unexpected buffer end")) {
+      
+      resetBotState(); // Ensure offline status
       clearAllIntervals();
       if (AUTO_REJOIN) {
         reconnectBot();
@@ -436,11 +455,9 @@ function startBot() {
 
   bot.on('end', async (reason) => {
     console.log('🔌 Bot disconnected:', reason);
-    isBotOnline = false;
     
-    // Ensure time is unfrozen before disconnect
     await ensureTimeUnfrozen();
-    
+    resetBotState(); // Ensure offline status
     clearAllIntervals();
     
     if (AUTO_REJOIN && !isShuttingDown) {
@@ -452,9 +469,8 @@ function startBot() {
     console.log('⛔ Bot was kicked:', reason);
     await sendDiscordEmbed('Bot Kicked', `Reason: ${reason}`, ERROR_EMBED_COLOR);
     
-    // Ensure time is unfrozen
     await ensureTimeUnfrozen();
-    
+    resetBotState(); // Ensure offline status
     clearAllIntervals();
     
     if (AUTO_REJOIN && !isShuttingDown) {
@@ -464,11 +480,19 @@ function startBot() {
 
   bot.on('chat', async (username, message) => {
     if (username !== botOptions.username) {
-      const player = Object.values(bot.players).find(p =>
-        p.username.replace(/^\./, '') === username.replace(/^\./, '')
-      );
-      const trueUsername = player?.username || username;
-      const uuid = player?.uuid || null;
+      // Logic to find real username if obfuscated
+      let trueUsername = username;
+      let uuid = null;
+      
+      if (bot && bot.players) {
+        const player = Object.values(bot.players).find(p =>
+          p.username.replace(/^\./, '') === username.replace(/^\./, '')
+        );
+        if (player) {
+            trueUsername = player.username;
+            uuid = player.uuid;
+        }
+      }
 
       sendPlayerMessage(trueUsername, message);
 
@@ -499,8 +523,6 @@ function startBot() {
         { name: 'Current Players', value: `${onlinePlayersCount} (excluding bot)`, inline: true }
       ]);
       sendPlayerList();
-      
-      // Check if we need to unfreeze time
       setTimeout(checkPlayerCount, 1000);
     }
   });
@@ -513,30 +535,12 @@ function startBot() {
         { name: 'Current Players', value: `${Math.max(0, onlinePlayersCount)} (excluding bot)`, inline: true }
       ]);
       sendPlayerList();
-      
-      // Check if we need to freeze time
       setTimeout(checkPlayerCount, 1000);
     }
   });
 
-  bot._client.on('player_info', (packet) => {
-    packet.data.forEach((player) => {
-      if (player.uuid === bot.uuid) {
-        const gamemodeMap = {
-          0: 'Survival',
-          1: 'Creative',
-          2: 'Adventure',
-          3: 'Spectator',
-        };
-        const currentGamemode = gamemodeMap[player.gamemode] || 'Unknown';
-        bot.game = bot.game || {};
-        bot.game.gameMode = currentGamemode;
-      }
-    });
-  });
-
   bot.on('health', () => {
-    // Health monitoring - can be extended for auto-healing
+    // Health monitoring
   });
 }
 
@@ -554,10 +558,7 @@ function reconnectBot() {
 }
 
 function forceRejoinBot() {
-  if (isShuttingDown) {
-    console.log('⚠️  Bot is shutting down, not rejoining');
-    return;
-  }
+  if (isShuttingDown) return;
   
   clearAllIntervals();
   console.log(`⏳ Rejoining in ${FIFTEEN_SECONDS / 1000} seconds...`);
@@ -582,55 +583,82 @@ function getCpuUsage() {
   const totalDifference = totalTick - lastCpuUsage.total;
 
   lastCpuUsage = { idle: totalIdle, total: totalTick };
-
+  // Check division by zero or NaN
+  if (totalDifference === 0) return 0;
   return 100 - (100 * idleDifference / totalDifference);
+}
+
+// --- HELPER to generate status payload safely ---
+async function getBotStatusPayload() {
+    const botActive = isBotOnline && bot && bot.entity;
+    
+    let onlinePlayersCount = 0;
+    let playerDetails = [];
+    
+    if (botActive) {
+        const playersExcludingBot = getOnlinePlayersExcludingBot();
+        onlinePlayersCount = playersExcludingBot.length;
+        // Map players
+        playerDetails = await Promise.all(playersExcludingBot.map(async p => {
+            const skinUrl = await getOrCreatePlayerFace(p.username, p.uuid);
+            return { username: p.username, uuid: p.uuid, skinUrl: skinUrl };
+        }));
+    }
+
+    let diskInfo = { free: 0, total: 0 };
+    try {
+        // Safe check for disk usage (platform independent)
+        const pathToCheck = os.platform() === 'win32' ? 'C:' : '/';
+        diskInfo = await diskusage.check(pathToCheck);
+    } catch (err) {
+        // console.error('Disk usage error (ignoring):', err.message); 
+        // Suppress generic disk errors to avoid log spam
+    }
+
+    return {
+        message: botActive ? "Bot is running!" : "Bot is offline",
+        onlinePlayersCount: onlinePlayersCount,
+        playerDetails: playerDetails,
+        
+        // Return N/A or 0 if bot is not active
+        gameMode: botActive && bot.game ? bot.game.gameMode : 'N/A',
+        position: botActive ?
+          {
+            x: Math.floor(bot.entity.position.x),
+            y: Math.floor(bot.entity.position.y),
+            z: Math.floor(bot.entity.position.z)
+          } : 'N/A',
+        
+        uptime: (botActive && botStartTime) ? Math.floor((Date.now() - botStartTime) / 1000) : 0,
+        movements: botActive ? movementCount : 0,
+        memoryUsage: `${Math.round(process.memoryUsage().rss / 1024 / 1024 * 100) / 100} MB`,
+        
+        lastOnline: lastOnlineTime,
+        serverHost: currentServerHost,
+        serverPort: currentServerPort,
+        botName: BOT_USERNAME,
+        
+        botHealth: botActive && bot.health !== undefined ? `${Math.round(bot.health)}/20` : '0/20',
+        botFood: botActive && bot.food !== undefined ? `${Math.round(bot.food)}/20` : '0/20',
+        botLatency: botActive && bot.player && bot.player.ping !== undefined ? `${bot.player.ping}ms` : '0ms',
+        
+        serverLoad: os.loadavg()[0].toFixed(2),
+        cpuUsage: getCpuUsage().toFixed(2),
+        diskFree: diskInfo.total > 0 ? `${(diskInfo.free / (1024 ** 3)).toFixed(2)} GB` : 'N/A',
+        diskTotal: diskInfo.total > 0 ? `${(diskInfo.total / (1024 ** 3)).toFixed(2)} GB` : 'N/A',
+        
+        minecraftDay: botActive && bot.time ? bot.time.day : 'N/A',
+        minecraftTime: botActive && bot.time ? bot.time.timeOfDay : 'N/A',
+        serverDifficulty: botActive && bot.game ? bot.game.difficulty : 'N/A',
+        timeFrozen: isTimeFrozen,
+        version: BOT_VERSION,
+    };
 }
 
 app.get('/api/status', async (req, res) => {
   try {
-    const playersExcludingBot = getOnlinePlayersExcludingBot();
-    const onlinePlayersCount = playersExcludingBot.length;
-    const playerDetails = await Promise.all(playersExcludingBot.map(async p => {
-      const skinUrl = await getOrCreatePlayerFace(p.username, p.uuid);
-      return {
-        username: p.username,
-        uuid: p.uuid,
-        skinUrl: skinUrl,
-      };
-    }));
-
-    const botStatus = {
-      message: isBotOnline ? "Bot is running!" : "Bot is offline",
-      onlinePlayersCount: onlinePlayersCount,
-      playerDetails,
-      gameMode: isBotOnline && bot?.game?.gameMode !== undefined ? bot.game.gameMode : 'N/A',
-      position: isBotOnline && bot?.entity?.position ?
-        {
-          x: Math.floor(bot.entity.position.x),
-          y: Math.floor(bot.entity.position.y),
-          z: Math.floor(bot.entity.position.z)
-        } : 'N/A',
-      uptime: botStartTime && isBotOnline ? Math.floor((Date.now() - botStartTime) / 1000) : 0,
-      movements: movementCount,
-      memoryUsage: `${Math.round(process.memoryUsage().rss / 1024 / 1024 * 100) / 100} MB`,
-      lastOnline: lastOnlineTime,
-      serverHost: currentServerHost,
-      serverPort: currentServerPort,
-      botName: BOT_USERNAME,
-      botHealth: isBotOnline && bot?.health !== undefined ? `${bot.health}/20` : 'N/A',
-      botFood: isBotOnline && bot?.food !== undefined ? `${bot.food}/20` : 'N/A',
-      botLatency: isBotOnline && bot?.player?.ping !== undefined ? `${bot.player.ping}ms` : 'N/A',
-      serverLoad: os.loadavg()[0].toFixed(2),
-      cpuUsage: getCpuUsage().toFixed(2),
-      diskFree: `${(diskusage.checkSync('/').free / (1024 ** 3)).toFixed(2)} GB`,
-      diskTotal: `${(diskusage.checkSync('/').total / (1024 ** 3)).toFixed(2)} GB`,
-      minecraftDay: isBotOnline && bot?.time?.day !== undefined ? bot.time.day : 'N/A',
-      minecraftTime: isBotOnline && bot?.time?.timeOfDay !== undefined ? bot.time.timeOfDay : 'N/A',
-      serverDifficulty: isBotOnline && bot?.game?.difficulty !== undefined ? bot.game.difficulty : 'N/A',
-      timeFrozen: isTimeFrozen,
-      version: BOT_VERSION,
-    };
-    res.json(botStatus);
+    const status = await getBotStatusPayload();
+    res.json(status);
   } catch (err) {
     console.error('❌ Error in /api/status:', err.message);
     res.status(500).json({ error: "Internal Server Error" });
@@ -687,57 +715,10 @@ io.on('connection', (socket) => {
   console.log('🔌 Client connected to Socket.IO');
 });
 
+// Global Interval for Socket Updates
 setInterval(async () => {
   try {
-    const playersExcludingBot = getOnlinePlayersExcludingBot();
-    const onlinePlayersCount = playersExcludingBot.length;
-    const playerDetails = await Promise.all(playersExcludingBot.map(async p => {
-      const skinUrl = await getOrCreatePlayerFace(p.username, p.uuid);
-      return {
-        username: p.username,
-        uuid: p.uuid,
-        skinUrl: skinUrl,
-      };
-    }));
-
-    let diskInfo = { free: 0, total: 0 };
-    try {
-      diskInfo = await diskusage.check('/');
-    } catch (err) {
-      console.error('❌ Disk usage check error:', err.message);
-    }
-
-    const botStatus = {
-      message: isBotOnline ? "Bot is running!" : "Bot is offline",
-      onlinePlayersCount: onlinePlayersCount,
-      playerDetails,
-      gameMode: isBotOnline && bot?.game?.gameMode !== undefined ? bot.game.gameMode : 'N/A',
-      position: isBotOnline && bot?.entity?.position ?
-        {
-          x: Math.floor(bot.entity.position.x),
-          y: Math.floor(bot.entity.position.y),
-          z: Math.floor(bot.entity.position.z)
-        } : 'N/A',
-      uptime: botStartTime && isBotOnline ? Math.floor((Date.now() - botStartTime) / 1000) : 0,
-      movements: movementCount,
-      memoryUsage: `${Math.round(process.memoryUsage().rss / 1024 / 1024 * 100) / 100} MB`,
-      lastOnline: lastOnlineTime,
-      serverHost: currentServerHost,
-      serverPort: currentServerPort,
-      botName: BOT_USERNAME,
-      botHealth: isBotOnline && bot?.health !== undefined ? `${bot.health}/20` : 'N/A',
-      botFood: isBotOnline && bot?.food !== undefined ? `${bot.food}/20` : 'N/A',
-      botLatency: isBotOnline && bot?.player?.ping !== undefined ? `${bot.player.ping}ms` : 'N/A',
-      serverLoad: os.loadavg()[0].toFixed(2),
-      cpuUsage: getCpuUsage().toFixed(2),
-      diskFree: `${(diskInfo.free / (1024 ** 3)).toFixed(2)} GB`,
-      diskTotal: `${(diskInfo.total / (1024 ** 3)).toFixed(2)} GB`,
-      minecraftDay: isBotOnline && bot?.time?.day !== undefined ? bot.time.day : 'N/A',
-      minecraftTime: isBotOnline && bot?.time?.timeOfDay !== undefined ? bot.time.timeOfDay : 'N/A',
-      serverDifficulty: isBotOnline && bot?.game?.difficulty !== undefined ? bot.game.difficulty : 'N/A',
-      timeFrozen: isTimeFrozen,
-      version: BOT_VERSION,
-    };
+    const botStatus = await getBotStatusPayload();
     io.emit('botStatusUpdate', botStatus);
   } catch (err) {
     console.error('❌ Error emitting status update via Socket.IO:', err.message);
@@ -793,3 +774,4 @@ process.on('SIGTERM', async () => {
 });
 
 startBot();
+              
