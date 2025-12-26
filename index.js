@@ -57,7 +57,7 @@ const botOptions = {
   host: BOT_HOST,
   port: BOT_PORT,
   username: BOT_USERNAME,
-  version: BOT_VERSION,
+  version: false,
   connectTimeout: null,
 };
 
