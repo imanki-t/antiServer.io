@@ -1,9 +1,9 @@
 {
   "bot": {
-    "host": "Leafsong.aternos.me",
-    "port": 36915,
-    "username": "Leaf",
-    "version": "1.21"
+    "host": "NoobsGang.aternos.me",
+    "port": 58020,
+    "username": "NOOB",
+    "version": "1.21.11"
   },
   "webhooks": {
     "discord": "",
