@@ -159,7 +159,7 @@ async function sendPlayerMessage(username, message) {
   try {
     await axios.post(MESSAGE_WEBHOOK, {
       // This sends a standard text message instead of an embed
-      content: `**${username}**: ${message}`
+      content: `💬 **${username}**: ${message}`
     });
   } catch (err) {
     console.error('❌ Message Webhook Error:', err.message);
@@ -1003,31 +1003,40 @@ function startBot() {
   });
 
   bot.on('playerJoined', async (player) => {
-    if (player.username !== botOptions.username) {
-      console.log(`👋 ${player.username} joined the game`);
-      const skinUrl = await getOrCreatePlayerFace(player.username, player.uuid);
-      player.skinUrl = skinUrl;
+  if (player.username !== botOptions.username) {
+    console.log(`👋 ${player.username} joined the game`);
+    const skinUrl = await getOrCreatePlayerFace(player.username, player.uuid);
+    player.skinUrl = skinUrl;
 
-      const onlinePlayersCount = getOnlinePlayersExcludingBot().length;
-      sendChatEmbed('Player Joined', `**${player.username}** joined the game.`, SUCCESS_EMBED_COLOR, [
-        { name: 'Current Players', value: `${onlinePlayersCount} (excluding bot)`, inline: true }
-      ]);
-      sendPlayerList();
-      setTimeout(checkPlayerCount, 1000);
+    // Change this part:
+    if (CHAT_WEBHOOK) {
+      await axios.post(CHAT_WEBHOOK, {
+        content: `📥 **${player.username}** joined the game.`
+      }).catch(err => console.error('❌ Join Webhook Error:', err.message));
     }
-  });
+
+    sendPlayerList();
+    setTimeout(checkPlayerCount, 1000);
+  }
+});
+  
 
   bot.on('playerLeft', (player) => {
-    if (player.username !== botOptions.username) {
-      console.log(`👋 ${player.username} left the game`);
-      const onlinePlayersCount = getOnlinePlayersExcludingBot().length;
-      sendChatEmbed('Player Left', `**${player.username}** left the game.`, 0xff4500, [
-        { name: 'Current Players', value: `${Math.max(0, onlinePlayersCount)} (excluding bot)`, inline: true }
-      ]);
-      sendPlayerList();
-      setTimeout(checkPlayerCount, 1000);
+  if (player.username !== botOptions.username) {
+    console.log(`👋 ${player.username} left the game`);
+    
+    // Change this part:
+    if (CHAT_WEBHOOK) {
+      axios.post(CHAT_WEBHOOK, {
+        content: `📤 **${player.username}** left the game.`
+      }).catch(err => console.error('❌ Leave Webhook Error:', err.message));
     }
-  });
+
+    sendPlayerList();
+    setTimeout(checkPlayerCount, 1000);
+  }
+});
+      
 
   bot.on('health', () => {
     // Health monitoring
