@@ -10,18 +10,14 @@ const mongoose = require('mongoose');
 const diskusage = require('diskusage');
 const fs = require('fs');
 
-// Load configuration
 let config;
 try {
   const configPath = path.join(__dirname, 'config.json');
   config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 } catch (err) {
-  console.error('❌ Failed to load config.json:', err.message);
-  console.error('Please create a config.json file. See config.example.json for reference.');
   process.exit(1);
 }
 
-// Extract configuration
 const BOT_HOST = process.env.BOT_HOST || config.bot.host;
 const BOT_PORT = parseInt(process.env.BOT_PORT, 10) || config.bot.port;
 const BOT_USERNAME = process.env.BOT_USERNAME || config.bot.username;
@@ -32,15 +28,6 @@ const MESSAGE_WEBHOOK = process.env.MESSAGE_WEBHOOK || config.webhooks.message;
 const WEB_SERVER_PORT = process.env.PORT || config.server.port;
 const MONGO_URI = process.env.MONGO_URI || config.database.mongoUri;
 
-const MOVEMENT_INTERVAL = config.intervals.movement;
-const LOOK_INTERVAL = config.intervals.look;
-const RECONNECT_DELAY = config.intervals.reconnect;
-const SOCKET_IO_UPDATE_INTERVAL = config.intervals.socketUpdate;
-const ACTIVITY_CHECK_INTERVAL = config.intervals.activityCheck;
-
-const ONE_HOUR = config.timeLimits.oneHour;
-const FIFTEEN_SECONDS = config.timeLimits.fifteenSeconds;
-
 const DEFAULT_EMBED_COLOR = config.embedColors.default;
 const SUCCESS_EMBED_COLOR = config.embedColors.success;
 const WARNING_EMBED_COLOR = config.embedColors.warning;
@@ -49,7 +36,6 @@ const INFO_EMBED_COLOR = config.embedColors.info;
 const CHAT_EMBED_COLOR = config.embedColors.chat;
 
 const FACES = config.faces;
-
 const AUTO_TIME_FREEZE = config.features.autoTimeFreeze;
 const ANTI_AFK = config.features.antiAFK;
 const AUTO_REJOIN = config.features.autoRejoin;
@@ -64,12 +50,11 @@ const botOptions = {
 
 let bot = null;
 let reconnectTimeout = null;
-let movementInterval = null;
-let lookInterval = null;
 let activityCheckTimeout = null;
 let botStartTime = null;
 let movementCount = 0;
 let isBotOnline = false;
+let connectionStatus = 'Offline';
 let lastOnlineTime = null;
 let currentServerHost = BOT_HOST;
 let currentServerPort = BOT_PORT;
@@ -78,7 +63,7 @@ let nextDotFaceIndex = 0;
 let isTimeFrozen = false;
 let otherPlayersOnline = 0;
 let isShuttingDown = false;
-let consecutiveFailures = 0; // Track connection failures
+let nextActionTimeout = null;
 
 const app = express();
 const server = http.createServer(app);
@@ -87,9 +72,11 @@ const io = new Server(server);
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-mongoose.connect(MONGO_URI)
-  .then(() => console.log('✅ MongoDB connected'))
-  .catch(err => console.error('❌ MongoDB connection error:', err));
+if (MONGO_URI) {
+  mongoose.connect(MONGO_URI)
+    .then(() => {})
+    .catch(err => {});
+}
 
 const chatSchema = new mongoose.Schema({
   username: String,
@@ -107,13 +94,9 @@ const playerFaceSchema = new mongoose.Schema({
 const PlayerFace = mongoose.model('PlayerFace', playerFaceSchema);
 
 function clearAllIntervals() {
-  if (movementInterval) {
-    clearInterval(movementInterval);
-    movementInterval = null;
-  }
-  if (lookInterval) {
-    clearInterval(lookInterval);
-    lookInterval = null;
+  if (nextActionTimeout) {
+    clearTimeout(nextActionTimeout);
+    nextActionTimeout = null;
   }
   if (reconnectTimeout) {
     clearTimeout(reconnectTimeout);
@@ -125,14 +108,12 @@ function clearAllIntervals() {
   }
 }
 
-// Reset state strictly to avoid fake data
 function resetBotState() {
   isBotOnline = false;
   botStartTime = null;
   movementCount = 0;
   isTimeFrozen = false;
   otherPlayersOnline = 0;
-  // Note: We do NOT reset lastOnlineTime so the dashboard knows when it was last seen
 }
 
 async function sendDiscordEmbed(title, description, color = DEFAULT_EMBED_COLOR, fields = []) {
@@ -141,9 +122,7 @@ async function sendDiscordEmbed(title, description, color = DEFAULT_EMBED_COLOR,
     await axios.post(DISCORD_WEBHOOK, {
       embeds: [{ title, description, color, fields, timestamp: new Date().toISOString() }],
     });
-  } catch (err) {
-    console.error('❌ Discord Webhook Error:', err.message);
-  }
+  } catch (err) {}
 }
 
 async function sendChatEmbed(title, description, color = SUCCESS_EMBED_COLOR, fields = []) {
@@ -152,9 +131,7 @@ async function sendChatEmbed(title, description, color = SUCCESS_EMBED_COLOR, fi
     await axios.post(CHAT_WEBHOOK, {
       embeds: [{ title, description, color, fields, timestamp: new Date().toISOString() }],
     });
-  } catch (err) {
-    console.error('❌ Chat Webhook Error:', err.message);
-  }
+  } catch (err) {}
 }
 
 async function sendPlayerMessage(username, message) {
@@ -164,212 +141,160 @@ async function sendPlayerMessage(username, message) {
       embeds: [{ 
         author: { name: username }, 
         description: message, 
-        color: CHAT_EMBED_COLOR,
+        color: CHAT_EMBED_COLOR, 
         timestamp: new Date().toISOString() 
       }],
     });
-  } catch (err) {
-    console.error('❌ Message Webhook Error:', err.message);
-  }
+  } catch (err) {}
 }
 
 function getOnlinePlayersExcludingBot() {
-  if (!bot || !bot.players || !isBotOnline) {
-    return [];
-  }
+  if (!bot || !bot.players || !isBotOnline) return [];
   return Object.values(bot.players).filter(p => p.username !== botOptions.username);
 }
 
-// Time freeze/unfreeze functions
-async function freezeTime() {
-  if (!bot || !isBotOnline || isTimeFrozen) return;
-  try {
-    bot.chat('/tick freeze');
-    isTimeFrozen = true;
-    console.log('⏸️  Time frozen - Bot is alone on the server');
-    await sendDiscordEmbed('Time Control', 'Time frozen - Bot is the only player online', INFO_EMBED_COLOR);
-  } catch (err) {
-    console.error('❌ Error freezing time:', err.message);
-  }
+function getRandomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-async function unfreezeTime() {
-  if (!bot || !isBotOnline || !isTimeFrozen) return;
-  try {
-    bot.chat('/tick unfreeze');
-    isTimeFrozen = false;
-    console.log('▶️  Time unfrozen - Other players joined');
-    await sendDiscordEmbed('Time Control', 'Time unfrozen - Other players online', INFO_EMBED_COLOR);
-  } catch (err) {
-    console.error('❌ Error unfreezing time:', err.message);
-  }
-}
+function triggerNextAction() {
+  if (!bot || !isBotOnline || !ANTI_AFK) return;
+  
+  const actions = [
+    { weight: 20, fn: actionWanderShort },
+    { weight: 10, fn: actionWanderLong },
+    { weight: 20, fn: actionLookAround },
+    { weight: 10, fn: actionToggleSneak },
+    { weight: 10, fn: actionJump },
+    { weight: 10, fn: actionSwingArm },
+    { weight: 10, fn: actionInventorySim },
+    { weight: 10, fn: actionSwapHotbar }
+  ];
 
-async function ensureTimeUnfrozen() {
-  if (isTimeFrozen && bot && isBotOnline) {
-    try {
-      bot.chat('/tick unfreeze');
-      isTimeFrozen = false;
-      console.log('✅ Time unfrozen before disconnect');
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    } catch (err) {
-      console.error('❌ Error ensuring time unfrozen:', err.message);
+  const totalWeight = actions.reduce((sum, action) => sum + action.weight, 0);
+  let random = Math.random() * totalWeight;
+  let selectedAction = actions[0].fn;
+
+  for (let action of actions) {
+    if (random < action.weight) {
+      selectedAction = action.fn;
+      break;
     }
+    random -= action.weight;
   }
+
+  selectedAction();
 }
 
-function checkPlayerCount() {
-  if (!bot || !AUTO_TIME_FREEZE || !isBotOnline) return;
-
-  const players = getOnlinePlayersExcludingBot();
-  otherPlayersOnline = players.length;
-
-  if (otherPlayersOnline === 0 && !isTimeFrozen) {
-    setTimeout(() => freezeTime(), 2000);
-  } else if (otherPlayersOnline > 0 && isTimeFrozen) {
-    unfreezeTime();
-  }
+function actionWanderShort() {
+  if (!bot) return;
+  const dirs = ['forward', 'back', 'left', 'right'];
+  const dir = dirs[Math.floor(Math.random() * dirs.length)];
+  bot.setControlState(dir, true);
+  
+  const duration = getRandomInt(500, 1500);
+  setTimeout(() => {
+    if (bot) bot.setControlState(dir, false);
+    scheduleNext();
+  }, duration);
+  movementCount++;
 }
 
-function sendPlayerList() {
-  if (!bot || !bot.players || !isBotOnline) return;
-  // Logic kept for potential Discord updates, but simplified
-}
+function actionWanderLong() {
+  if (!bot) return;
+  const dirs = ['forward', 'left', 'right'];
+  const dir = dirs[Math.floor(Math.random() * dirs.length)];
+  bot.setControlState(dir, true);
+  bot.setControlState('sprint', true);
+  if (Math.random() > 0.5) bot.setControlState('jump', true);
 
-function sendBotStats() {
-  if (!bot || !isBotOnline) return;
-  try {
-    const uptime = botStartTime ? Math.floor((Date.now() - botStartTime) / 1000) : 0;
-    const hours = Math.floor(uptime / 3600);
-    const minutes = Math.floor((uptime % 3600) / 60);
-    const seconds = uptime % 60;
-    const uptimeStr = `${hours}h ${minutes}m ${seconds}s`;
-    
-    // Safety check for entity
-    const position = bot.entity ? bot.entity.position : { x: 0, y: 0, z: 0 };
-    const posStr = `X: ${Math.floor(position.x)}, Y: ${Math.floor(position.y)}, Z: ${Math.floor(position.z)}`;
-    
-    const memoryUsage = process.memoryUsage();
-    const memoryStr = `${Math.round(memoryUsage.rss / 1024 / 1024 * 100) / 100} MB`;
-    const gameModeDisplay = bot?.game?.gameMode || 'N/A';
-    const onlinePlayersCount = getOnlinePlayersExcludingBot().length;
-
-    sendDiscordEmbed('Bot Status Report', `Status report for ${botOptions.username}`, INFO_EMBED_COLOR, [
-      { name: 'Uptime', value: uptimeStr, inline: true },
-      { name: 'Position', value: posStr, inline: true },
-      { name: 'Game Mode', value: gameModeDisplay, inline: true },
-      { name: 'Memory Usage', value: memoryStr, inline: true },
-      { name: 'Movement Count', value: `${movementCount} moves`, inline: true },
-      { name: 'Players Online', value: `${onlinePlayersCount} (excluding bot)`, inline: true },
-      { name: 'Time Status', value: isTimeFrozen ? '⏸️ Frozen' : '▶️ Running', inline: true },
-      { name: 'Server Load', value: `${os.loadavg()[0].toFixed(2)}`, inline: true }
-    ]);
-  } catch (err) {
-    console.error('❌ Error sending bot stats:', err.message);
-  }
-}
-
-// ✅ IMPROVED: More human-like, less predictable anti-AFK movements
-function performMovement() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  try {
-    const randomAction = Math.random();
-
-    // More varied and human-like behavior patterns
-    if (randomAction < 0.25) {
-        // 25% Walk in random directions with varied speed
-        const directions = ['forward', 'back', 'left', 'right'];
-        const direction = directions[Math.floor(Math.random() * directions.length)];
-        
-        bot.setControlState(direction, true);
-        
-        // Randomly sprint
-        if (Math.random() < 0.3) {
-            bot.setControlState('sprint', true);
-        }
-        
-        // Random jump while moving (more natural)
-        if (Math.random() < 0.15) {
-            bot.setControlState('jump', true);
-        }
-
-        // Varied movement duration (0.3 - 2 seconds)
-        const duration = 300 + Math.random() * 1700; 
-        setTimeout(() => {
-            if (bot) {
-                bot.clearControlStates();
-            }
-        }, duration);
-
-    } else if (randomAction < 0.4) {
-        // 15% Look around (simulate checking surroundings)
-        const yaw = Math.random() * Math.PI * 2;
-        const pitch = (Math.random() * Math.PI / 2) - (Math.PI / 4);
-        bot.look(yaw, pitch, true);
-
-    } else if (randomAction < 0.5) {
-        // 10% Sneak briefly (more human-like)
-        bot.setControlState('sneak', true);
-        setTimeout(() => {
-            if (bot) bot.setControlState('sneak', false);
-        }, 500 + Math.random() * 1000);
-
-    } else if (randomAction < 0.65) {
-        // 15% Jump in place
-        bot.setControlState('jump', true);
-        setTimeout(() => {
-            if (bot) bot.setControlState('jump', false);
-        }, 500);
-
-    } else if (randomAction < 0.8) {
-        // 15% Swing arm
-        const hand = Math.random() < 0.5 ? 'right' : 'left';
-        bot.swingArm(hand);
-
-    } else {
-        // 20% Rotate body (look around naturally)
-        const smallYaw = bot.entity.yaw + (Math.random() - 0.5) * Math.PI / 2;
-        const smallPitch = (Math.random() - 0.5) * Math.PI / 6;
-        bot.look(smallYaw, smallPitch, true);
+  const duration = getRandomInt(2000, 4000);
+  setTimeout(() => {
+    if (bot) {
+      bot.setControlState(dir, false);
+      bot.setControlState('sprint', false);
+      bot.setControlState('jump', false);
     }
-
-    movementCount++;
-  } catch (err) {
-    console.error('❌ Movement error:', err.message);
-  }
+    scheduleNext();
+  }, duration);
+  movementCount++;
 }
 
-function lookAround() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  try {
-    const yaw = Math.random() * Math.PI * 2;
-    const pitch = (Math.random() * Math.PI / 3) - (Math.PI / 6);
-    bot.look(yaw, pitch, true);
-  } catch (err) {
-    console.error('❌ Look error:', err.message);
-  }
+function actionLookAround() {
+  if (!bot || !bot.entity) return;
+  const yaw = Math.random() * Math.PI * 2;
+  const pitch = (Math.random() * Math.PI / 2) - (Math.PI / 4);
+  bot.look(yaw, pitch);
+  scheduleNext(getRandomInt(500, 2000));
+}
+
+function actionToggleSneak() {
+  if (!bot) return;
+  bot.setControlState('sneak', true);
+  setTimeout(() => {
+    if (bot) bot.setControlState('sneak', false);
+    scheduleNext();
+  }, getRandomInt(1000, 3000));
+  movementCount++;
+}
+
+function actionJump() {
+  if (!bot) return;
+  bot.setControlState('jump', true);
+  setTimeout(() => {
+    if (bot) bot.setControlState('jump', false);
+    scheduleNext();
+  }, 500);
+  movementCount++;
+}
+
+function actionSwingArm() {
+  if (!bot) return;
+  const arm = Math.random() > 0.5 ? 'right' : 'left';
+  bot.swingArm(arm);
+  scheduleNext(getRandomInt(500, 1500));
+  movementCount++;
+}
+
+function actionInventorySim() {
+  if (!bot) return;
+  bot.clearControlStates();
+  const delay = getRandomInt(2000, 5000);
+  setTimeout(() => {
+    scheduleNext();
+  }, delay);
+}
+
+function actionSwapHotbar() {
+  if (!bot) return;
+  const slot = getRandomInt(0, 8);
+  bot.setQuickBarSlot(slot);
+  scheduleNext(getRandomInt(500, 1500));
+}
+
+function scheduleNext(delayOverride) {
+  if (!isBotOnline) return;
+  const delay = delayOverride || getRandomInt(1000, 6000);
+  nextActionTimeout = setTimeout(triggerNextAction, delay);
 }
 
 function setupIntervals() {
-  movementInterval = setInterval(performMovement, MOVEMENT_INTERVAL);
-  lookInterval = setInterval(lookAround, LOOK_INTERVAL);
+  triggerNextAction();
+  
   activityCheckTimeout = setInterval(() => {
     checkBotActivity();
     checkPlayerCount();
-  }, ACTIVITY_CHECK_INTERVAL);
+  }, 5000);
+
   setTimeout(sendPlayerList, 5000);
   setTimeout(sendBotStats, 10000);
-  setTimeout(checkPlayerCount, 3000);
 }
 
 function checkBotActivity() {
   if (!botStartTime || !isBotOnline || !ANTI_AFK) return;
-
   const uptime = Date.now() - botStartTime;
-  if (uptime >= ONE_HOUR) {
-    sendDiscordEmbed('Bot Activity', 'Bot active for over 1 hour. Rejoining to prevent AFK detection.', WARNING_EMBED_COLOR);
+  if (uptime >= 3600000) {
     forceRejoinBot();
-    return;
   }
 }
 
@@ -415,11 +340,81 @@ async function getOrCreatePlayerFace(username, uuid) {
   return skinUrl;
 }
 
-function startBot() {
-  if (isShuttingDown) {
-    console.log('⚠️  Bot is shutting down, not starting new connection');
-    return;
+function freezeTime() {
+  if (!bot || !isBotOnline || isTimeFrozen) return;
+  try {
+    bot.chat('/tick freeze');
+    isTimeFrozen = true;
+    sendDiscordEmbed('Time Control', 'Time frozen - Bot is the only player online', INFO_EMBED_COLOR);
+  } catch (err) {}
+}
+
+function unfreezeTime() {
+  if (!bot || !isBotOnline || !isTimeFrozen) return;
+  try {
+    bot.chat('/tick unfreeze');
+    isTimeFrozen = false;
+    sendDiscordEmbed('Time Control', 'Time unfrozen - Other players online', INFO_EMBED_COLOR);
+  } catch (err) {}
+}
+
+async function ensureTimeUnfrozen() {
+  if (isTimeFrozen && bot && isBotOnline) {
+    try {
+      bot.chat('/tick unfreeze');
+      isTimeFrozen = false;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    } catch (err) {}
   }
+}
+
+function checkPlayerCount() {
+  if (!bot || !AUTO_TIME_FREEZE || !isBotOnline) return;
+  const players = getOnlinePlayersExcludingBot();
+  otherPlayersOnline = players.length;
+  if (otherPlayersOnline === 0 && !isTimeFrozen) {
+    setTimeout(() => freezeTime(), 2000);
+  } else if (otherPlayersOnline > 0 && isTimeFrozen) {
+    unfreezeTime();
+  }
+}
+
+function sendPlayerList() {
+  if (!bot || !bot.players || !isBotOnline) return;
+}
+
+function sendBotStats() {
+  if (!bot || !isBotOnline) return;
+  try {
+    const uptime = botStartTime ? Math.floor((Date.now() - botStartTime) / 1000) : 0;
+    const hours = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
+    const seconds = uptime % 60;
+    const uptimeStr = `${hours}h ${minutes}m ${seconds}s`;
+    
+    const position = bot.entity ? bot.entity.position : { x: 0, y: 0, z: 0 };
+    const posStr = `X: ${Math.floor(position.x)}, Y: ${Math.floor(position.y)}, Z: ${Math.floor(position.z)}`;
+    
+    const memoryUsage = process.memoryUsage();
+    const memoryStr = `${Math.round(memoryUsage.rss / 1024 / 1024 * 100) / 100} MB`;
+    const gameModeDisplay = bot?.game?.gameMode || 'N/A';
+    const onlinePlayersCount = getOnlinePlayersExcludingBot().length;
+
+    sendDiscordEmbed('Bot Status Report', `Status report for ${botOptions.username}`, INFO_EMBED_COLOR, [
+      { name: 'Uptime', value: uptimeStr, inline: true },
+      { name: 'Position', value: posStr, inline: true },
+      { name: 'Game Mode', value: gameModeDisplay, inline: true },
+      { name: 'Memory Usage', value: memoryStr, inline: true },
+      { name: 'Movement Count', value: `${movementCount} moves`, inline: true },
+      { name: 'Players Online', value: `${onlinePlayersCount} (excluding bot)`, inline: true },
+      { name: 'Time Status', value: isTimeFrozen ? '⏸️ Frozen' : '▶️ Running', inline: true },
+      { name: 'Server Load', value: `${os.loadavg()[0].toFixed(2)}`, inline: true }
+    ]);
+  } catch (err) {}
+}
+
+function startBot() {
+  if (isShuttingDown) return;
 
   clearAllIntervals();
   if (bot) {
@@ -427,106 +422,64 @@ function startBot() {
     bot = null;
   }
 
-  // Reset state on start attempt
   resetBotState();
-
-  console.log(`🚀 Starting bot with version ${BOT_VERSION}...`);
+  connectionStatus = 'Connecting...';
+  
   bot = mineflayer.createBot(botOptions);
 
   bot.once('spawn', () => {
     sendDiscordEmbed('Bot Connected', `${botOptions.username} has joined the server (v${BOT_VERSION})`, SUCCESS_EMBED_COLOR);
     isBotOnline = true;
+    connectionStatus = 'Online';
     botStartTime = Date.now();
     lastOnlineTime = Date.now();
-    consecutiveFailures = 0; // Reset failure counter on successful connection
-    console.log(`✅ Bot spawned successfully on ${BOT_HOST}:${BOT_PORT}`);
 
-    // Safe socket keepalive
     if (bot._client && bot._client.socket) {
       bot._client.socket.setKeepAlive(true, 30000);
     }
     
-    // Move the player_info listener here to ensure _client exists
     if (bot._client) {
       bot._client.on('player_info', (packet) => {
         packet.data.forEach((player) => {
           if (player.uuid === bot.uuid) {
             const gamemodeMap = { 0: 'Survival', 1: 'Creative', 2: 'Adventure', 3: 'Spectator' };
-            const currentGamemode = gamemodeMap[player.gamemode] || 'Unknown';
             bot.game = bot.game || {};
-            bot.game.gameMode = currentGamemode;
+            bot.game.gameMode = gamemodeMap[player.gamemode] || 'Unknown';
           }
         });
       });
     }
 
-    setTimeout(() => {
-      setupIntervals();
-    }, 1000);
+    setTimeout(setupIntervals, 1000);
   });
 
   bot.on('error', (err) => {
-    console.error('❌ Bot Error:', err.message);
-    sendDiscordEmbed('Bot Error', `Error: ${err.message}`, ERROR_EMBED_COLOR);
-
-    if (err.message.includes("timed out") ||
-        err.message.includes("ECONNRESET") ||
-        err.message.includes("ECONNREFUSED") ||
-        err.name === 'PartialReadError' ||
-        err.message.includes("Unexpected buffer end")) {
-      
-      resetBotState();
-      clearAllIntervals();
-      consecutiveFailures++;
-      
-      if (AUTO_REJOIN) {
-        reconnectBot();
-      }
+    if (AUTO_REJOIN) {
+      reconnectBot(err.message);
     }
   });
 
   bot.on('end', async (reason) => {
-    console.log('🔌 Bot disconnected:', reason);
-    
     await ensureTimeUnfrozen();
-    resetBotState();
-    clearAllIntervals();
-    consecutiveFailures++;
-    
     if (AUTO_REJOIN && !isShuttingDown) {
-      reconnectBot();
+      reconnectBot(reason);
     }
   });
 
-  // ✅ FIXED: Properly handle kicks (including Aternos AFK kicks) with auto-rejoin
   bot.on('kicked', async (reason) => {
-    console.log('⛔ Bot was kicked:', reason);
-    const reasonStr = typeof reason === 'string' ? reason : JSON.stringify(reason);
-    await sendDiscordEmbed('Bot Kicked', `Reason: ${reasonStr}`, ERROR_EMBED_COLOR);
-    
+    await sendDiscordEmbed('Bot Kicked', `Reason: ${reason}`, ERROR_EMBED_COLOR);
     await ensureTimeUnfrozen();
-    resetBotState();
-    clearAllIntervals();
     
-    // Check if it's an Aternos AFK kick
-    const isAfkKick = reasonStr.toLowerCase().includes('idle') || 
-                     reasonStr.toLowerCase().includes('afk') || 
-                     reasonStr.toLowerCase().includes('terms of service');
+    const isBan = reason.toLowerCase().includes('banned') || reason.toLowerCase().includes('suspended') || reason.toLowerCase().includes('violate');
     
-    if (isAfkKick) {
-      console.log('⚠️  Detected AFK kick from Aternos. Will attempt to rejoin.');
-      consecutiveFailures++;
-      // Use longer delay for AFK kicks (30 seconds)
+    if (isBan) {
+      connectionStatus = 'Banned (Cooldown 5m)';
       if (AUTO_REJOIN && !isShuttingDown) {
-        console.log(`⏳ Reconnecting after AFK kick in 30 seconds...`);
-        reconnectTimeout = setTimeout(() => {
-          startBot();
-        }, 30000);
+        reconnectBot(reason, 300000);
       }
     } else {
-      consecutiveFailures++;
       if (AUTO_REJOIN && !isShuttingDown) {
-        reconnectBot();
+        reconnectBot(reason);
       }
     }
   });
@@ -558,72 +511,51 @@ function startBot() {
           timestamp: chatMessage.timestamp,
           skinUrl,
         });
-      } catch (err) {
-        console.error('❌ Error saving chat message to MongoDB:', err.message);
-      }
+      } catch (err) {}
     }
   });
 
   bot.on('playerJoined', async (player) => {
     if (player.username !== botOptions.username) {
-      console.log(`👋 ${player.username} joined the game`);
       const skinUrl = await getOrCreatePlayerFace(player.username, player.uuid);
       player.skinUrl = skinUrl;
-
       const onlinePlayersCount = getOnlinePlayersExcludingBot().length;
       sendChatEmbed('Player Joined', `**${player.username}** joined the game.`, SUCCESS_EMBED_COLOR, [
         { name: 'Current Players', value: `${onlinePlayersCount} (excluding bot)`, inline: true }
       ]);
-      sendPlayerList();
       setTimeout(checkPlayerCount, 1000);
     }
   });
 
   bot.on('playerLeft', (player) => {
     if (player.username !== botOptions.username) {
-      console.log(`👋 ${player.username} left the game`);
       const onlinePlayersCount = getOnlinePlayersExcludingBot().length;
       sendChatEmbed('Player Left', `**${player.username}** left the game.`, 0xff4500, [
         { name: 'Current Players', value: `${Math.max(0, onlinePlayersCount)} (excluding bot)`, inline: true }
       ]);
-      sendPlayerList();
       setTimeout(checkPlayerCount, 1000);
     }
   });
-
-  bot.on('health', () => {
-    // Health monitoring
-  });
 }
 
-// ✅ IMPROVED: Use exponential backoff for reconnection attempts
-function reconnectBot() {
-  if (isShuttingDown) {
-    console.log('⚠️  Bot is shutting down, not reconnecting');
-    return;
-  }
-  
+function reconnectBot(reason, delay) {
+  if (isShuttingDown) return;
   clearAllIntervals();
   
-  // Exponential backoff with cap at 5 minutes
-  const baseDelay = RECONNECT_DELAY;
-  const maxDelay = 300000; // 5 minutes
-  const delay = Math.min(baseDelay * Math.pow(2, Math.min(consecutiveFailures, 5)), maxDelay);
+  const waitTime = delay || 3000;
+  if (!connectionStatus.startsWith('Banned')) {
+    connectionStatus = `Reconnecting in ${Math.round(waitTime/1000)}s...`;
+  }
   
-  console.log(`⏳ Reconnecting in ${delay / 1000} seconds... (Attempt ${consecutiveFailures + 1})`);
   reconnectTimeout = setTimeout(() => {
     startBot();
-  }, delay);
+  }, waitTime);
 }
 
 function forceRejoinBot() {
   if (isShuttingDown) return;
-  
-  clearAllIntervals();
-  console.log(`⏳ Rejoining in ${FIFTEEN_SECONDS / 1000} seconds...`);
-  activityCheckTimeout = setTimeout(() => {
-    startBot();
-  }, FIFTEEN_SECONDS);
+  connectionStatus = 'Refreshing Session...';
+  if (bot) bot.quit();
 }
 
 function getCpuUsage() {
@@ -646,7 +578,6 @@ function getCpuUsage() {
   return 100 - (100 * idleDifference / totalDifference);
 }
 
-// ✅ FIXED: Return proper offline status when bot is not connected
 async function getBotStatusPayload() {
     const botActive = isBotOnline && bot && bot.entity;
     
@@ -666,41 +597,33 @@ async function getBotStatusPayload() {
     try {
         const pathToCheck = os.platform() === 'win32' ? 'C:' : '/';
         diskInfo = await diskusage.check(pathToCheck);
-    } catch (err) {
-        // Suppress disk errors
-    }
+    } catch (err) {}
 
-    // ✅ Return appropriate values based on online status
     return {
-        message: botActive ? "Bot is running!" : "Bot is offline",
-        onlinePlayersCount: botActive ? onlinePlayersCount : 0,
-        playerDetails: botActive ? playerDetails : [],
-        
+        message: connectionStatus,
+        onlinePlayersCount: onlinePlayersCount,
+        playerDetails: playerDetails,
         gameMode: botActive && bot.game ? bot.game.gameMode : 'N/A',
-        position: botActive ? {
+        position: botActive ?
+          {
             x: Math.floor(bot.entity.position.x),
             y: Math.floor(bot.entity.position.y),
             z: Math.floor(bot.entity.position.z)
-        } : 'N/A',
-        
+          } : 'N/A',
         uptime: (botActive && botStartTime) ? Math.floor((Date.now() - botStartTime) / 1000) : 0,
-        movements: botActive ? movementCount : 0,
+        movements: movementCount,
         memoryUsage: `${Math.round(process.memoryUsage().rss / 1024 / 1024 * 100) / 100} MB`,
-        
-        lastOnline: lastOnlineTime || null,
+        lastOnline: lastOnlineTime,
         serverHost: currentServerHost,
         serverPort: currentServerPort,
         botName: BOT_USERNAME,
-        
         botHealth: botActive && bot.health !== undefined ? `${Math.round(bot.health)}/20` : 'N/A',
         botFood: botActive && bot.food !== undefined ? `${Math.round(bot.food)}/20` : 'N/A',
         botLatency: botActive && bot.player && bot.player.ping !== undefined ? `${bot.player.ping}ms` : 'N/A',
-        
         serverLoad: os.loadavg()[0].toFixed(2),
         cpuUsage: getCpuUsage().toFixed(2),
         diskFree: diskInfo.total > 0 ? `${(diskInfo.free / (1024 ** 3)).toFixed(2)} GB` : 'N/A',
         diskTotal: diskInfo.total > 0 ? `${(diskInfo.total / (1024 ** 3)).toFixed(2)} GB` : 'N/A',
-        
         minecraftDay: botActive && bot.time ? bot.time.day : 'N/A',
         minecraftTime: botActive && bot.time ? bot.time.timeOfDay : 'N/A',
         serverDifficulty: botActive && bot.game ? bot.game.difficulty : 'N/A',
@@ -714,7 +637,6 @@ app.get('/api/status', async (req, res) => {
     const status = await getBotStatusPayload();
     res.json(status);
   } catch (err) {
-    console.error('❌ Error in /api/status:', err.message);
     res.status(500).json({ error: "Internal Server Error" });
   }
 });
@@ -750,7 +672,6 @@ app.get('/api/chat', async (req, res) => {
 
     res.json(messagesWithFaces);
   } catch (err) {
-    console.error('❌ Error fetching chat history:', err.message);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
@@ -760,71 +681,41 @@ app.get('/api/chat/usernames', async (req, res) => {
     const usernames = await MinecraftChat.distinct('username');
     res.json(usernames);
   } catch (err) {
-    console.error('❌ Error fetching distinct usernames:', err.message);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
-io.on('connection', (socket) => {
-  console.log('🔌 Client connected to Socket.IO');
-});
+io.on('connection', (socket) => {});
 
-// Global Interval for Socket Updates
 setInterval(async () => {
   try {
     const botStatus = await getBotStatusPayload();
     io.emit('botStatusUpdate', botStatus);
-  } catch (err) {
-    console.error('❌ Error emitting status update via Socket.IO:', err.message);
-  }
-}, SOCKET_IO_UPDATE_INTERVAL);
+  } catch (err) {}
+}, 1000);
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
 });
 
 server.listen(WEB_SERVER_PORT, () => {
-  console.log(`🌐 Web monitoring server started on port ${WEB_SERVER_PORT}`);
   sendDiscordEmbed('Web Server', `Web monitoring server started on port ${WEB_SERVER_PORT}`, DEFAULT_EMBED_COLOR);
 });
 
-// Graceful shutdown
 process.on('SIGINT', async () => {
-  console.log('\n⚠️  Received SIGINT, shutting down gracefully...');
   isShuttingDown = true;
-  
   await ensureTimeUnfrozen();
-  
-  if (bot) {
-    await sendDiscordEmbed('Bot Shutdown', 'Bot is shutting down gracefully', WARNING_EMBED_COLOR);
-    bot.quit();
-  }
-  
+  if (bot) bot.quit();
   clearAllIntervals();
-  
-  setTimeout(() => {
-    console.log('✅ Shutdown complete');
-    process.exit(0);
-  }, 2000);
+  setTimeout(() => process.exit(0), 1000);
 });
 
 process.on('SIGTERM', async () => {
-  console.log('\n⚠️  Received SIGTERM, shutting down gracefully...');
   isShuttingDown = true;
-  
   await ensureTimeUnfrozen();
-  
-  if (bot) {
-    await sendDiscordEmbed('Bot Shutdown', 'Bot is shutting down gracefully', WARNING_EMBED_COLOR);
-    bot.quit();
-  }
-  
+  if (bot) bot.quit();
   clearAllIntervals();
-  
-  setTimeout(() => {
-    console.log('✅ Shutdown complete');
-    process.exit(0);
-  }, 2000);
+  setTimeout(() => process.exit(0), 1000);
 });
 
 startBot();
