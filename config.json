@@ -17,8 +17,6 @@
     "mongoUri": ""
   },
   "intervals": {
-    "movement": 5000,
-    "look": 3000,
     "reconnect": 3000,
     "socketUpdate": 1000,
     "activityCheck": 5000
