@@ -158,12 +158,8 @@ async function sendPlayerMessage(username, message) {
   if (username === botOptions.username || !MESSAGE_WEBHOOK) return;
   try {
     await axios.post(MESSAGE_WEBHOOK, {
-      embeds: [{ 
-        author: { name: username }, 
-        description: message, 
-        color: CHAT_EMBED_COLOR,
-        timestamp: new Date().toISOString() 
-      }],
+      // This sends a standard text message instead of an embed
+      content: `**${username}**: ${message}`
     });
   } catch (err) {
     console.error('❌ Message Webhook Error:', err.message);
