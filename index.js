@@ -1435,7 +1435,7 @@ async function executeSneakJumpCombo() {
   movementCount++;
 }
 
-async function executeStrafeL ookCombo() {
+async function executeStrafeLookCombo() {
   if (!bot || !bot.entity || !isBotOnline) return;
   
   const duration = getRandomDelay(2000, 4000);
@@ -1589,7 +1589,7 @@ async function executeAction(actionName) {
       // Combos
       case 'JUMP_SPRINT_COMBO': await executeJumpSprintCombo(); break;
       case 'SNEAK_JUMP_COMBO': await executeSneakJumpCombo(); break;
-      case 'STRAFE_LOOK_COMBO': await executeStrafeL ookCombo(); break;
+      case 'STRAFE_LOOK_COMBO': await executeStrafeLookCombo(); break;
       case 'WALK_LOOK_COMBO': await executeWalkLookCombo(); break;
       
       // Spectator-specific
