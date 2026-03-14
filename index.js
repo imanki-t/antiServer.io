@@ -57,7 +57,7 @@ const botOptions = {
   port: BOT_PORT,
   username: BOT_USERNAME,
   version: BOT_VERSION,
-  connectTimeout: null,
+  connectTimeout: 30000,
 };
 
 let bot = null;
@@ -589,6 +589,9 @@ async function executeSprintTravel() {
   const jumpInterval = setInterval(() => {
     if (bot && Math.random() < 0.25) {
       bot.setControlState('jump', true);
+      setTimeout(() => {
+        if (bot) bot.setControlState('jump', false);
+      }, 300);
     }
   }, 1000);
   
@@ -1744,7 +1747,22 @@ function startBot() {
   console.log(`🚀 Starting bot with version ${BOT_VERSION}...`);
   bot = mineflayer.createBot(botOptions);
 
+  // Guard: if bot connects but never spawns (Aternos still loading), restart after 90s
+  const spawnTimeout = setTimeout(() => {
+    if (!isBotOnline) {
+      console.log('⚠️  Bot connected but never spawned after 90s — Aternos may still be loading. Restarting...');
+      if (bot) {
+        bot.removeAllListeners();
+        try { bot.quit(); } catch(e) {}
+        bot = null;
+      }
+      consecutiveFailures++;
+      if (AUTO_REJOIN && !isShuttingDown) reconnectBot();
+    }
+  }, 90000);
+
   bot.once('spawn', () => {
+    clearTimeout(spawnTimeout);
     sendDiscordEmbed('Bot Connected', `${botOptions.username} has joined the server (v${BOT_VERSION})`, SUCCESS_EMBED_COLOR);
     isBotOnline = true;
     botStartTime = Date.now();
@@ -1779,19 +1797,14 @@ function startBot() {
     console.error('❌ Bot Error:', err.message);
     sendDiscordEmbed('Bot Error', `Error: ${err.message}`, ERROR_EMBED_COLOR);
 
-    if (err.message.includes("timed out") ||
-        err.message.includes("ECONNRESET") ||
-        err.message.includes("ECONNREFUSED") ||
-        err.name === 'PartialReadError' ||
-        err.message.includes("Unexpected buffer end")) {
-      
-      resetBotState();
-      clearAllIntervals();
-      consecutiveFailures++;
-      
-      if (AUTO_REJOIN) {
-        reconnectBot();
-      }
+    // Reconnect on ANY error — previously only specific codes triggered reconnect,
+    // which caused the bot to get permanently stuck on DNS errors, login failures, etc.
+    resetBotState();
+    clearAllIntervals();
+    consecutiveFailures++;
+
+    if (AUTO_REJOIN) {
+      reconnectBot();
     }
   });
 
@@ -1918,11 +1931,12 @@ function reconnectBot() {
   
   clearAllIntervals();
   
-  const baseDelay = RECONNECT_DELAY;
-  const maxDelay = 300000;
+  const baseDelay = RECONNECT_DELAY; // now 30000ms from config
+  const maxDelay = 300000; // 5 minutes max
+  // Exponential backoff, capped at maxDelay
   const delay = Math.min(baseDelay * Math.pow(2, Math.min(consecutiveFailures, 5)), maxDelay);
   
-  console.log(`⏳ Reconnecting in ${delay / 1000} seconds... (Attempt ${consecutiveFailures + 1})`);
+  console.log(`⏳ Reconnecting in ${delay / 1000}s... (Failure #${consecutiveFailures}). Waiting for Aternos to be ready.`);
   reconnectTimeout = setTimeout(() => {
     startBot();
   }, delay);
