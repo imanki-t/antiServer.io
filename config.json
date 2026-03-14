@@ -2,8 +2,8 @@
   "bot": {
     "host": "NoobsGang.aternos.me",
     "port": 58020,
-    "username": "NoobBOT",
-    "version": "1.21.8"
+    "username": "NOOB",
+    "version": "1.21.11"
   },
   "webhooks": {
     "discord": "",
@@ -17,7 +17,7 @@
     "mongoUri": ""
   },
   "intervals": {
-    "reconnect": 5000,
+    "reconnect": 3000,
     "socketUpdate": 1000,
     "activityCheck": 5000
   },
