@@ -1,9 +1,9 @@
 {
   "bot": {
     "host": "NoobsGang.aternos.me",
-    "port":  45944,
+    "port": 45944,
     "username": "NOOB",
-    "version": "1.21.11"
+    "version": "1.21.3"
   },
   "webhooks": {
     "discord": "",
