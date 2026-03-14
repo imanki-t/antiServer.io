@@ -3,7 +3,7 @@
     "host": "NoobsGang.aternos.me",
     "port": 58020,
     "username": "NoobBOT",
-    "version": "1.21.11"
+    "version": "1.21.8"
   },
   "webhooks": {
     "discord": "",
