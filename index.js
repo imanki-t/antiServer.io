@@ -57,7 +57,7 @@ const botOptions = {
   port: BOT_PORT,
   username: BOT_USERNAME,
   version: BOT_VERSION,
-  connectTimeout: null,
+  connectTimeout: 30000,
 };
 
 let bot = null;
@@ -589,6 +589,9 @@ async function executeSprintTravel() {
   const jumpInterval = setInterval(() => {
     if (bot && Math.random() < 0.25) {
       bot.setControlState('jump', true);
+      setTimeout(() => {
+        if (bot) bot.setControlState('jump', false);
+      }, 300);
     }
   }, 1000);
   
@@ -1780,8 +1783,12 @@ function startBot() {
     sendDiscordEmbed('Bot Error', `Error: ${err.message}`, ERROR_EMBED_COLOR);
 
     if (err.message.includes("timed out") ||
+        err.message.includes("ETIMEDOUT") ||
+        err.code === 'ETIMEDOUT' ||
         err.message.includes("ECONNRESET") ||
+        err.code === 'ECONNRESET' ||
         err.message.includes("ECONNREFUSED") ||
+        err.code === 'ECONNREFUSED' ||
         err.name === 'PartialReadError' ||
         err.message.includes("Unexpected buffer end")) {
       
