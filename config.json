@@ -2,7 +2,7 @@
   "bot": {
     "host": "NoobsGang.aternos.me",
     "port": 58020,
-    "username": "Noob",
+    "username": "NoobBOT",
     "version": "1.21.11"
   },
   "webhooks": {
