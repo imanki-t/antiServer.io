@@ -54,7 +54,7 @@ const AUTO_REJOIN = config.features.autoRejoin;
 
 const botOptions = {
   host: BOT_HOST,
-  port: BOT_PORT,
+  port: BOT_PORT === 25565 ? undefined : BOT_PORT, // omit port so SRV DNS auto-resolves on default
   username: BOT_USERNAME,
   version: BOT_VERSION,
   connectTimeout: 30000,
