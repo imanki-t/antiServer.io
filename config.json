@@ -23,7 +23,7 @@
   },
   "timeLimits": {
     "oneHour": 3600000,
-    "fifteenSeconds": 5000
+    "fifteenSeconds": 15000
   },
   "embedColors": {
     "default": 3447003,
