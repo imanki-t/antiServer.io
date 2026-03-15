@@ -57,6 +57,7 @@ const botOptions = {
   port: BOT_PORT,
   username: BOT_USERNAME,
   version: BOT_VERSION,
+  auth: 'offline',
   connectTimeout: null,
 };
 
