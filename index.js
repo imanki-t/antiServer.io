@@ -7,6 +7,7 @@ const express = require('express');
 const path = require('path');
 const os = require('os');
 const http = require('http');
+const dns = require('dns').promises;
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const diskusage = require('diskusage');
@@ -1183,14 +1184,18 @@ function scheduleReconnect() {
   clearAllHandles();
   const delay = getReconnectDelay();
   console.log(`⏳ Reconnecting in ${delay / 1000}s (failure #${consecutiveFailures + 1})...`);
-  reconnectHandle = setTimeout(() => startBot(), delay);
+  reconnectHandle = setTimeout(() => startBot().catch(err => {
+    console.error('❌ startBot error:', err.message);
+  }), delay);
 }
 
 function forceRejoin() {
   if (isShuttingDown) return;
   clearAllHandles();
   console.log(`⏳ Force-rejoining in 5s...`);
-  reconnectHandle = setTimeout(() => startBot(), 5000);
+  reconnectHandle = setTimeout(() => startBot().catch(err => {
+    console.error('❌ startBot error:', err.message);
+  }), 5000);
 }
 
 // ============================================================================
@@ -1319,9 +1324,46 @@ async function getBotStatusPayload() {
 }
 
 // ============================================================================
+// 🔍 DNS SRV RESOLVER
+// Aternos updates _minecraft._tcp.<host> SRV record every server restart
+// with the current real IP + port. We look this up before every connection
+// so the bot always uses the correct port automatically.
+// ============================================================================
+async function resolveServerAddress(host) {
+  const srvName = `_minecraft._tcp.${host}`;
+  try {
+    const records = await dns.resolveSrv(srvName);
+    if (records && records.length > 0) {
+      // Pick the highest-priority record (lowest priority value)
+      records.sort((a, b) => a.priority - b.priority);
+      const record = records[0];
+      console.log(`🔍 SRV lookup ${srvName} → ${record.name}:${record.port}`);
+      return { host: record.name, port: record.port };
+    }
+  } catch (err) {
+    console.log(`⚠️  SRV lookup failed for ${srvName}: ${err.message}`);
+  }
+
+  // Fallback: try plain A record — port stays as config value
+  try {
+    const addresses = await dns.resolve4(host);
+    if (addresses && addresses.length > 0) {
+      console.log(`🔍 A record lookup ${host} → ${addresses[0]}:${BOT_PORT} (using config port)`);
+      return { host: addresses[0], port: BOT_PORT };
+    }
+  } catch (err) {
+    console.log(`⚠️  A record lookup also failed: ${err.message}`);
+  }
+
+  // Last resort: use config values as-is
+  console.log(`⚠️  DNS resolution failed — falling back to config: ${host}:${BOT_PORT}`);
+  return { host, port: BOT_PORT };
+}
+
+// ============================================================================
 // 🤖 BOT STARTUP
 // ============================================================================
-function startBot() {
+async function startBot() {
   if (isShuttingDown) {
     console.log('🛑 Shutting down — not starting bot');
     return;
@@ -1339,20 +1381,31 @@ function startBot() {
   }
 
   resetBotState();
-  currentServerHost = BOT_HOST;
-  currentServerPort = BOT_PORT;
 
-  console.log(`\n🚀 Connecting to ${BOT_HOST}:${BOT_PORT} as ${BOT_USERNAME} (${BOT_VERSION})...`);
+  // --- Resolve current IP + port from Aternos DNS SRV record ---
+  console.log(`\n🔍 Resolving DNS for ${BOT_HOST}...`);
+  const resolved = await resolveServerAddress(BOT_HOST);
+  currentServerHost = resolved.host;
+  currentServerPort = resolved.port;
+
+  console.log(`\n🚀 Connecting to ${currentServerHost}:${currentServerPort} as ${BOT_USERNAME} (${BOT_VERSION})...`);
 
   const botOptions = {
-    host:           BOT_HOST,
-    port:           BOT_PORT,
-    username:       BOT_USERNAME,
-    version:        BOT_VERSION,
-    keepAlive:      true,
-    checkTimeoutInterval: 30000,
-    chatLengthLimit: 256,
-    auth:           'offline',
+    host:                 currentServerHost,
+    port:                 currentServerPort,
+    username:             BOT_USERNAME,
+    version:              BOT_VERSION,
+    keepAlive:            true,
+    // Increase from 30s to 120s — Render→Aternos latency is high and the
+    // default 30s keepalive window is too tight, causing endless timeouts
+    checkTimeoutInterval: 120000,
+    closeTimeout:         120000,
+    // Disable physics during the 1.21 login/configuration phase — without
+    // this, mineflayer sends physics packets too early and the server drops
+    // the connection before spawn fires (GitHub issue #3776)
+    physicsEnabled:       false,
+    chatLengthLimit:      256,
+    auth:                 'offline',
   };
 
   try {
@@ -1378,6 +1431,10 @@ function startBot() {
   bot.once('spawn', async () => {
     clearTimeout(spawnTimeoutHandle);
     spawnTimeoutHandle = null;
+
+    // Re-enable physics now that configuration phase is complete
+    // (was disabled to prevent 1.21 config-phase packet rejection)
+    bot.physicsEnabled = true;
 
     console.log(`✅ Spawned on ${BOT_HOST}:${BOT_PORT}`);
 
@@ -1478,13 +1535,13 @@ function startBot() {
 
   // ---- ERROR ----
   bot.on('error', (err) => {
-    // Stop ghost actions immediately
     botReady   = false;
     isBotOnline = false;
 
     const msg = err.message || String(err);
     console.error('❌ Bot error:', msg);
 
+    const isKeepaliveTimeout = msg.includes('timed out after');
     const isNetworkError =
       msg.includes('ECONNRESET')   ||
       msg.includes('ECONNREFUSED') ||
@@ -1494,10 +1551,21 @@ function startBot() {
       msg.includes('PartialReadError') ||
       msg.includes('Unexpected buffer end');
 
-    if (isNetworkError) {
-      sendDiscordEmbed('Network Error', `${msg}`, WARNING_COLOR);
-      clearAllHandles();
-      consecutiveFailures++;
+    clearAllHandles();
+    consecutiveFailures++;
+
+    if (isKeepaliveTimeout) {
+      // Keepalive timeout = high latency spike, not a true disconnect.
+      // Wait 20s before retrying so we don't hammer the server.
+      console.log('⚠️  Keepalive timeout — waiting 20s before reconnect (high latency)');
+      sendDiscordEmbed('Keepalive Timeout', 'High latency to Aternos — reconnecting in 20s', WARNING_COLOR);
+      if (AUTO_REJOIN) {
+        reconnectHandle = setTimeout(() => startBot().catch(err => {
+          console.error('❌ startBot error:', err.message);
+        }), 20000);
+      }
+    } else if (isNetworkError) {
+      sendDiscordEmbed('Network Error', msg, WARNING_COLOR);
       if (AUTO_REJOIN) scheduleReconnect();
     } else {
       sendDiscordEmbed('Bot Error', msg, ERROR_COLOR);
@@ -1546,7 +1614,9 @@ function startBot() {
     if (AUTO_REJOIN && !isShuttingDown) {
       if (isAfkKick) {
         console.log('🔄 AFK kick detected — waiting 30s before rejoin...');
-        reconnectHandle = setTimeout(() => startBot(), 30000);
+        reconnectHandle = setTimeout(() => startBot().catch(err => {
+          console.error('❌ startBot error:', err.message);
+        }), 30000);
       } else {
         scheduleReconnect();
       }
@@ -1721,7 +1791,7 @@ app.post('/api/reconnect', (req, res) => {
   res.json({ message: 'Reconnect initiated' });
   setTimeout(() => {
     consecutiveFailures = 0;
-    startBot();
+    startBot().catch(err => console.error('❌ startBot error:', err.message));
   }, 1000);
 });
 
@@ -1853,7 +1923,7 @@ async function boot() {
 
   // Small delay then start bot
   await sleep(2000);
-  startBot();
+  await startBot();
 }
 
 boot();
