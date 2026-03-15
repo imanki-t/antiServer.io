@@ -3,7 +3,7 @@
     "host": "NoobsGang.aternos.me",
     "port": 25565,
     "username": "NOOB",
-    "version": "1.21.3",
+    "version": "1.21.11",
     "_note": "Port is auto-resolved from Aternos DNS SRV record on every connect. The port field here is only used as a last resort fallback if DNS completely fails."
   },
   "webhooks": {
