@@ -143,6 +143,7 @@ let behaviorPhase      = 'active';
 let actionSchedulerHandle  = null;
 let activityCheckHandle    = null;
 let reconnectHandle        = null;
+let heartbeatHandle        = null;
 
 // Action guard — prevents ghost actions
 let actionInProgress   = false;
@@ -179,6 +180,10 @@ function canActSpectator() {
 // 🔄 STATE HELPERS
 // ============================================================================
 function clearAllHandles() {
+  if (heartbeatHandle) {
+    clearInterval(heartbeatHandle);
+    heartbeatHandle = null;
+  }
   if (actionSchedulerHandle) {
     clearTimeout(actionSchedulerHandle);
     actionSchedulerHandle = null;
@@ -1056,8 +1061,29 @@ function pickAction() {
 }
 
 // ============================================================================
-// ⚙️ ACTION EXECUTOR + SCHEDULER
+// 💓 ANTI-TIMEOUT HEARTBEAT
+// Aternos kicks bots that send zero packets for ~30s.
+// This fires every 4 seconds and sends a guaranteed tiny movement packet
+// (a look update) so the server always sees activity, regardless of what
+// the action scheduler is doing.
 // ============================================================================
+function startHeartbeat() {
+  if (heartbeatHandle) clearInterval(heartbeatHandle);
+
+  heartbeatHandle = setInterval(() => {
+    if (!canActSpectator()) return;
+
+    try {
+      // Tiny micro-look — imperceptible to a human watcher but counts as a
+      // movement packet to the server, resetting its idle timer.
+      const yaw   = bot.entity.yaw   + (Math.random() - 0.5) * 0.03;
+      const pitch = bot.entity.pitch + (Math.random() - 0.5) * 0.015;
+      bot.look(yaw, pitch, false);
+    } catch (_) {}
+  }, 4000); // every 4 seconds — well within Aternos 30s timeout window
+}
+
+
 async function executeAction(action) {
   // Double-check guard before every action
   if (!canActSpectator() || actionInProgress) return;
@@ -1088,7 +1114,7 @@ function scheduleNextAction() {
   switch (behaviorPhase) {
     case 'active':   minMs =  500; maxMs =  4000; break;
     case 'moderate': minMs = 2000; maxMs =  9000; break;
-    case 'idle':     minMs = 5000; maxMs = 18000; break;
+    case 'idle':     minMs = 3000; maxMs = 12000; break;
     default:         minMs = 1000; maxMs =  6000;
   }
 
@@ -1324,7 +1350,7 @@ function startBot() {
     username:       BOT_USERNAME,
     version:        BOT_VERSION,
     keepAlive:      true,
-    checkTimeoutInterval: 60000,
+    checkTimeoutInterval: 30000,
     chatLengthLimit: 256,
     auth:           'offline',
   };
@@ -1387,6 +1413,7 @@ function startBot() {
               updateSpectatorMode();
               if (!wasSpectator && isInSpectatorMode) {
                 console.log('🎮 Game mode switched to SPECTATOR — starting movement engine');
+                startHeartbeat();
                 if (!actionSchedulerHandle) scheduleNextAction();
               } else if (wasSpectator && !isInSpectatorMode) {
                 console.log('⚠️  No longer in spectator — movement engine paused');
@@ -1435,6 +1462,7 @@ function startBot() {
     if (isInSpectatorMode) {
       console.log('🎮 Already in spectator mode — starting movement engine');
       await sleep(500);
+      startHeartbeat();
       scheduleNextAction();
     }
 
