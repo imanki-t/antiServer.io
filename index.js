@@ -1178,70 +1178,22 @@ async function startBot() {
 
   resetBotState();
 
-  // Auto-detect version — specifying a wrong sub-version (e.g. 1.21.11 when
-  // server is 1.21.1) causes a silent hang. Let mineflayer read it from the server.
-  console.log(`🚀 Connecting as ${BOT_USERNAME} → ${BOT_HOST}:${BOT_PORT} (version: auto-detect)…`);
+  console.log(`🚀 Connecting as ${BOT_USERNAME} (v${BOT_VERSION}) → ${BOT_HOST}:${BOT_PORT}…`);
 
+  // Clean minimal createBot — mineflayer officially supports 1.21.11.
+  // No custom overrides to _client internals which break the config phase.
   bot = mineflayer.createBot({
     host:     BOT_HOST,
     port:     BOT_PORT,
     username: BOT_USERNAME,
-    version:  false,   // auto-detect — avoids silent hangs from sub-version mismatch
+    version:  BOT_VERSION,
     auth:     'offline',
-    checkTimeoutInterval: 30000,
-    closeTimeout:         240000,
-    physicsEnabled:       false,  // critical for 1.21+ config phase (issue #3776)
-    hideErrors:           false,
   });
 
-  // ── WORKAROUND for mineflayer issue #3623 ─────────────────────────────────
-  // Mineflayer doesn't send the `client_information` packet during the 1.20.2+
-  // configuration phase, causing servers to silently drop the connection.
-  // We manually send it when we detect the configuration phase starting.
-  // ─────────────────────────────────────────────────────────────────────────
-  bot._client.on('state', (newState) => {
-    console.log(`🔄 Protocol state → ${newState}`);
-    if (newState === 'configuration') {
-      console.log('📦 Sending manual client_information for configuration phase…');
-      try {
-        bot._client.write('client_information', {
-          locale:              'en_US',
-          viewDistance:        10,
-          chatFlags:           0,
-          chatColors:          true,
-          skinParts:           127,
-          mainHand:            1,
-          enableTextFiltering: false,
-          enableServerListing: true,
-          particleStatus:      0,
-        });
-      } catch (e) {
-        // Some mineflayer versions use different packet name
-        try {
-          bot._client.write('settings', {
-            locale:          'en_US',
-            viewDistance:    10,
-            chatFlags:       0,
-            chatColors:      true,
-            skinParts:       127,
-            mainHand:        1,
-            enableTextFiltering: false,
-            enableServerListing: true,
-          });
-        } catch { /* ignore — mineflayer may handle it internally */ }
-      }
-    }
-  });
-
-  // Log every connection stage
-  bot._client.on('state', (newState) => { /* already logged above */ });
-  bot.once('login',         () => console.log('🔑 Login phase complete…'));
-  bot.once('inject_allowed',() => console.log('💉 inject_allowed fired'));
-
-  // ── WATCHDOG: 30s — if spawn hasn't fired, connection is silently hung ──
+  // Watchdog — if spawn hasn't fired in 60s the connection is silently hung
   spawnWatchdogTimeout = setTimeout(() => {
     if (isBotOnline) return;
-    console.warn('⚠️  Watchdog: no spawn in 30s — force-killing hung connection');
+    console.warn('⚠️  Watchdog: no spawn in 60s — restarting');
     if (bot) {
       bot.removeAllListeners();
       try { bot._client?.end('watchdog'); } catch { /* ignore */ }
@@ -1249,14 +1201,10 @@ async function startBot() {
     }
     consecutiveFailures++;
     scheduleReconnect();
-  }, 30_000);
+  }, 60_000);
 
   bot.once('spawn', () => {
-    // Cancel watchdog — spawned successfully
     if (spawnWatchdogTimeout) { clearTimeout(spawnWatchdogTimeout); spawnWatchdogTimeout = null; }
-    // Re-enable physics 2s AFTER spawn — issue #3776 says doing it immediately
-    // can still cause config-phase errors on some 1.21 server setups
-    setTimeout(() => { if (bot && !bot._ended) bot.physicsEnabled = true; }, 2000);
     isBotOnline    = true;
     botStartTime   = Date.now();
     lastOnlineTime = Date.now();
