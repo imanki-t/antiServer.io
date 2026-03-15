@@ -1458,33 +1458,84 @@ async function startBot() {
     clearTimeout(spawnTimeoutHandle);
     spawnTimeoutHandle = null;
 
+    console.log(`🔄 Spawn event fired — validating real game state...`);
+
     // Re-enable physics now that configuration phase is complete
-    // (was disabled to prevent 1.21 config-phase packet rejection)
     // Small delay per GitHub issue #3776 recommendation
     setTimeout(() => {
       if (bot && !bot._ended) bot.physicsEnabled = true;
     }, 2000);
 
-    console.log(`✅ Spawned successfully on ${currentServerHost}:${currentServerPort}`);
+    // ----------------------------------------------------------------
+    // POST-SPAWN VALIDATION
+    // Aternos's infrastructure proxy accepts TCP connections even when
+    // the Minecraft server is offline. It sends enough packets to fire
+    // mineflayer's 'spawn' event before kicking the bot. Without this
+    // check, isBotOnline gets set to true from a fake proxy spawn.
+    //
+    // We wait 4 seconds and then verify ALL of:
+    //  1. Bot object still exists and isn't ended
+    //  2. bot.entity exists (means we have a real position)
+    //  3. bot.entity.position is not 0,0,0 (proxy default)
+    //  4. bot.game exists with a valid gameMode
+    //  5. bot.players object exists (real server populates this)
+    // ----------------------------------------------------------------
+    await sleep(4000);
 
-    isBotOnline        = true;
-    botStartTime       = Date.now();
-    lastOnlineTime     = Date.now();
+    // Check bot is still alive after the wait
+    if (!bot || bot._ended) {
+      console.log('⚠️  Bot ended during post-spawn validation — was a proxy fake spawn');
+      return;
+    }
+
+    // Validate entity
+    const hasEntity = bot.entity &&
+      bot.entity.position &&
+      !(bot.entity.position.x === 0 && bot.entity.position.y === 0 && bot.entity.position.z === 0);
+
+    // Validate game state
+    const hasGame = bot.game && bot.game.gameMode !== undefined && bot.game.gameMode !== null;
+
+    // Validate players list (real server always has at least the bot itself)
+    const hasPlayers = bot.players && Object.keys(bot.players).length > 0;
+
+    if (!hasEntity || !hasGame || !hasPlayers) {
+      console.log(`⚠️  Post-spawn validation FAILED — Aternos proxy fake spawn detected`);
+      console.log(`    entity:${!!hasEntity} game:${!!hasGame} players:${!!hasPlayers}`);
+      console.log(`    This means the Minecraft server is still offline/starting`);
+
+      // Don't reconnect instantly — give Aternos server time to actually start
+      consecutiveFailures++;
+      try { bot.quit('Server not ready'); } catch (_) {}
+      if (AUTO_REJOIN && !isShuttingDown) {
+        const delay = 15000 + Math.random() * 10000; // 15-25s
+        console.log(`⏳ Waiting ${Math.floor(delay / 1000)}s for server to fully start...`);
+        reconnectHandle = setTimeout(() => startBot().catch(e => {
+          console.error('❌ startBot error:', e.message);
+        }), delay);
+      }
+      return;
+    }
+
+    console.log(`✅ Post-spawn validation PASSED — bot is genuinely online`);
+    console.log(`   Position: ${Math.floor(bot.entity.position.x)},${Math.floor(bot.entity.position.y)},${Math.floor(bot.entity.position.z)} | Mode: ${bot.game.gameMode}`);
+
+    // NOW it's safe to mark as online
+    isBotOnline         = true;
+    botStartTime        = Date.now();
+    lastOnlineTime      = Date.now();
     consecutiveFailures = 0;
 
     // Keep TCP alive
     if (bot._client && bot._client.socket) {
       bot._client.socket.setKeepAlive(true, 30000);
-      bot._client.socket.setTimeout(0); // no idle timeout
+      bot._client.socket.setTimeout(0);
     }
 
-    // Wait for game mode packet (give server time to set it)
-    await sleep(1500);
-
-    // Detect game mode from bot.game
+    // Detect game mode
     updateSpectatorMode();
 
-    // Also listen for game mode changes via player_info packet
+    // Listen for game mode changes via player_info packet
     if (bot._client) {
       bot._client.on('player_info', (packet) => {
         if (!packet || !packet.data) return;
@@ -1514,9 +1565,9 @@ async function startBot() {
         });
       });
 
-      // Also listen for game_state_change (for game mode updates)
+      // Listen for game_state_change (game mode updates)
       bot._client.on('game_state_change', (packet) => {
-        if (packet.reason === 3) { // change game mode
+        if (packet.reason === 3) {
           const gmMap = { 0: 'survival', 1: 'creative', 2: 'adventure', 3: 'spectator' };
           const gm    = gmMap[packet.gameMode];
           if (gm) {
@@ -1532,8 +1583,7 @@ async function startBot() {
     botReady = true;
 
     if (!isInSpectatorMode) {
-      console.log('⚠️  Bot spawned but NOT in spectator mode — waiting for mode to be set');
-      console.log('   (Bot will only perform movements once confirmed in spectator mode)');
+      console.log('⚠️  Bot online but NOT in spectator mode — waiting for mode to be set');
     }
 
     sendDiscordEmbed(
@@ -1544,7 +1594,7 @@ async function startBot() {
 
     setupActivityCheck();
 
-    // Start movement engine only if already in spectator
+    // Start movement engine if already in spectator
     if (isInSpectatorMode) {
       console.log('🎮 Already in spectator mode — starting movement engine');
       await sleep(500);
