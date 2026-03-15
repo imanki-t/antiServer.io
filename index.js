@@ -1396,13 +1396,17 @@ async function startBot() {
     username:             BOT_USERNAME,
     version:              BOT_VERSION,
     keepAlive:            true,
-    hideErrors:           false,
-    // 120s — Render→Aternos latency is high, default 30s is too tight
-    checkTimeoutInterval: 120000,
-    closeTimeout:         120000,
+    // null = disable client-side keepalive timeout entirely.
+    // Render→Aternos latency is unpredictable and spikes past any fixed
+    // value. The bot still RESPONDS to server keepalives — it just won't
+    // self-disconnect if the round-trip takes too long. The OS TCP stack
+    // handles actual dead connections via socket.setKeepAlive below.
+    checkTimeoutInterval: null,
+    closeTimeout:         null,
     // Disable physics during 1.21 login/configuration phase to prevent
     // server dropping connection before spawn fires (GitHub issue #3776)
     physicsEnabled:       false,
+    hideErrors:           false,
     chatLengthLimit:      256,
     auth:                 'offline',
   };
