@@ -1396,13 +1396,12 @@ async function startBot() {
     username:             BOT_USERNAME,
     version:              BOT_VERSION,
     keepAlive:            true,
-    // Increase from 30s to 120s — Render→Aternos latency is high and the
-    // default 30s keepalive window is too tight, causing endless timeouts
+    hideErrors:           false,
+    // 120s — Render→Aternos latency is high, default 30s is too tight
     checkTimeoutInterval: 120000,
     closeTimeout:         120000,
-    // Disable physics during the 1.21 login/configuration phase — without
-    // this, mineflayer sends physics packets too early and the server drops
-    // the connection before spawn fires (GitHub issue #3776)
+    // Disable physics during 1.21 login/configuration phase to prevent
+    // server dropping connection before spawn fires (GitHub issue #3776)
     physicsEnabled:       false,
     chatLengthLimit:      256,
     auth:                 'offline',
@@ -1417,35 +1416,42 @@ async function startBot() {
     return;
   }
 
-  // ---- FIX: Send client_information during 1.20.2+ configuration phase ----
-  // Mineflayer never sends this packet, causing 1.21+ servers to silently hang
-  // the connection — spawn never fires and the 30s timeout triggers instead.
-  bot._client.on('configuration.select_known_packs', () => {
-    try {
-      bot._client.write('configuration.client_information', {
-        locale:               'en_US',
-        viewDistance:         10,
-        chatMode:             0,
-        chatColors:           true,
-        displayedSkinParts:   127,
-        mainHand:             1,
-        enableTextFiltering:  false,
-        allowServerListings:  true,
-        particleStatus:       0,
-      });
-      console.log('📦 Sent client_information during config phase');
-    } catch (_) {}
+  // ---- LOGIN EVENT — fires when TCP connection is established ----
+  // This proves the bot IS talking to the server. Cancel the short
+  // pre-login timeout and start a much longer spawn timeout instead,
+  // because Aternos can take 60-90s to load chunks after login.
+  bot.once('login', () => {
+    console.log('🔗 Login established — waiting for world to load (up to 90s)...');
+
+    // Cancel any existing spawn watchdog
+    if (spawnTimeoutHandle) {
+      clearTimeout(spawnTimeoutHandle);
+      spawnTimeoutHandle = null;
+    }
+
+    // Start a generous post-login spawn timeout (90s)
+    // Aternos is slow — chunk loading after login can take a long time
+    spawnTimeoutHandle = setTimeout(() => {
+      if (!isBotOnline) {
+        console.log('⏰ World never loaded after login (90s) — retrying...');
+        consecutiveFailures++;
+        try { bot.quit('World load timeout'); } catch (_) {}
+        scheduleReconnect();
+      }
+    }, 90000);
   });
 
-  // ---- SPAWN TIMEOUT — if bot never fires 'spawn' within SPAWN_TIMEOUT_MS ----
+  // ---- PRE-LOGIN TIMEOUT — if TCP connection never establishes ----
+  // Short: 30s is fine here because if login doesn't fire in 30s,
+  // the server is genuinely unreachable (offline, wrong port, etc.)
   spawnTimeoutHandle = setTimeout(() => {
     if (!isBotOnline) {
-      console.log(`⏰ Spawn timeout after ${SPAWN_TIMEOUT_MS / 1000}s — retrying...`);
+      console.log(`⏰ Connection timeout — server unreachable after 30s (offline or wrong port?)`);
       consecutiveFailures++;
-      try { bot.quit('Spawn timeout'); } catch (_) {}
+      try { bot.quit('Connection timeout'); } catch (_) {}
       scheduleReconnect();
     }
-  }, SPAWN_TIMEOUT_MS);
+  }, 30000);
 
   // ---- SPAWN ----
   bot.once('spawn', async () => {
@@ -1454,9 +1460,12 @@ async function startBot() {
 
     // Re-enable physics now that configuration phase is complete
     // (was disabled to prevent 1.21 config-phase packet rejection)
-    bot.physicsEnabled = true;
+    // Small delay per GitHub issue #3776 recommendation
+    setTimeout(() => {
+      if (bot && !bot._ended) bot.physicsEnabled = true;
+    }, 2000);
 
-    console.log(`✅ Spawned on ${BOT_HOST}:${BOT_PORT}`);
+    console.log(`✅ Spawned successfully on ${currentServerHost}:${currentServerPort}`);
 
     isBotOnline        = true;
     botStartTime       = Date.now();
