@@ -1,3 +1,5 @@
+'use strict';
+
 const mineflayer = require('mineflayer');
 const axios = require('axios');
 const Vec3 = require('vec3');
@@ -10,252 +12,315 @@ const mongoose = require('mongoose');
 const diskusage = require('diskusage');
 const fs = require('fs');
 
-// Load configuration
+// ============================================================================
+// 🔧 CONFIGURATION LOADER
+// ============================================================================
 let config;
 try {
   const configPath = path.join(__dirname, 'config.json');
   config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 } catch (err) {
   console.error('❌ Failed to load config.json:', err.message);
-  console.error('Please create a config.json file. See config.example.json for reference.');
   process.exit(1);
 }
 
-// Extract configuration
-const BOT_HOST = process.env.BOT_HOST || config.bot.host;
-const BOT_PORT = parseInt(process.env.BOT_PORT, 10) || config.bot.port;
-const BOT_USERNAME = process.env.BOT_USERNAME || config.bot.username;
-const BOT_VERSION = config.bot.version;
+// Extract configuration with env overrides
+const BOT_HOST        = process.env.BOT_HOST     || config.bot.host;
+const BOT_PORT        = parseInt(process.env.BOT_PORT, 10) || config.bot.port;
+const BOT_USERNAME    = process.env.BOT_USERNAME  || config.bot.username;
+const BOT_VERSION     = process.env.BOT_VERSION   || config.bot.version;
+
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || config.webhooks.discord;
-const CHAT_WEBHOOK = process.env.CHAT_WEBHOOK || config.webhooks.chat;
+const CHAT_WEBHOOK    = process.env.CHAT_WEBHOOK    || config.webhooks.chat;
 const MESSAGE_WEBHOOK = process.env.MESSAGE_WEBHOOK || config.webhooks.message;
-const WEB_SERVER_PORT = process.env.PORT || config.server.port;
-const MONGO_URI = process.env.MONGO_URI || config.database.mongoUri;
 
-const RECONNECT_DELAY = config.intervals.reconnect;
-const SOCKET_IO_UPDATE_INTERVAL = config.intervals.socketUpdate;
-const ACTIVITY_CHECK_INTERVAL = config.intervals.activityCheck;
+const WEB_SERVER_PORT = parseInt(process.env.PORT, 10) || config.server.port;
+const MONGO_URI       = process.env.MONGO_URI || config.database.mongoUri;
 
-const ONE_HOUR = config.timeLimits.oneHour;
-const FIFTEEN_SECONDS = config.timeLimits.fifteenSeconds;
+// Reconnect delays: 3s → 5s → 10s (capped)
+const RECONNECT_DELAYS    = config.intervals.reconnectDelays || [3000, 5000, 10000];
+const SOCKET_UPDATE_MS    = config.intervals.socketUpdate    || 1000;
+const ACTIVITY_CHECK_MS   = config.intervals.activityCheck   || 5000;
+const KEEP_ALIVE_MS       = config.intervals.keepAlive       || 840000; // 14 min
 
-const DEFAULT_EMBED_COLOR = config.embedColors.default;
-const SUCCESS_EMBED_COLOR = config.embedColors.success;
-const WARNING_EMBED_COLOR = config.embedColors.warning;
-const ERROR_EMBED_COLOR = config.embedColors.error;
-const INFO_EMBED_COLOR = config.embedColors.info;
-const CHAT_EMBED_COLOR = config.embedColors.chat;
+const ONE_HOUR            = config.timeLimits.oneHour        || 3600000;
+const SPAWN_TIMEOUT_MS    = config.timeLimits.spawnTimeout   || 30000;
+
+const DEFAULT_COLOR  = config.embedColors.default;
+const SUCCESS_COLOR  = config.embedColors.success;
+const WARNING_COLOR  = config.embedColors.warning;
+const ERROR_COLOR    = config.embedColors.error;
+const INFO_COLOR     = config.embedColors.info;
+const CHAT_COLOR     = config.embedColors.chat;
 
 const FACES = config.faces;
 
 const AUTO_TIME_FREEZE = config.features.autoTimeFreeze;
-const ANTI_AFK = config.features.antiAFK;
-const AUTO_REJOIN = config.features.autoRejoin;
+const ANTI_AFK         = config.features.antiAFK;
+const AUTO_REJOIN      = config.features.autoRejoin;
+const SELF_PING        = config.features.selfPing;
+const SPECTATOR_ONLY   = config.features.spectatorOnly;
 
-const botOptions = {
-  host: BOT_HOST,
-  port: BOT_PORT,
-  username: BOT_USERNAME,
-  version: BOT_VERSION,
-  connectTimeout: null,
-};
-
-let bot = null;
-let reconnectTimeout = null;
-let actionSchedulerTimeout = null;
-let activityCheckTimeout = null;
-let botStartTime = null;
-let movementCount = 0;
-let isBotOnline = false;
-let lastOnlineTime = null;
-let currentServerHost = BOT_HOST;
-let currentServerPort = BOT_PORT;
-let lastCpuUsage = process.cpuUsage();
-let nextDotFaceIndex = 0;
-let isTimeFrozen = false;
-let otherPlayersOnline = 0;
-let isShuttingDown = false;
-let consecutiveFailures = 0;
-let currentAction = null;
-let actionInProgress = false;
-
-// New tracking variables for advanced behavior
-let behaviorPhase = 'active'; // active, moderate, idle
-let nearbyPlayers = [];
-let lastPlayerCheckTime = 0;
-let mistakeCounter = 0;
-let isInSpectatorMode = false;
-
-const app = express();
+// ============================================================================
+// 🌐 EXPRESS + SOCKET.IO SETUP
+// ============================================================================
+const app    = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io     = new Server(server, {
+  cors: { origin: '*' },
+  pingTimeout: 60000,
+  pingInterval: 25000,
+});
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-mongoose.connect(MONGO_URI)
-  .then(() => console.log('✅ MongoDB connected'))
-  .catch(err => console.error('❌ MongoDB connection error:', err));
+// ============================================================================
+// 🗄️ MONGODB SETUP (optional — skip gracefully if no URI)
+// ============================================================================
+let dbConnected = false;
+let MinecraftChat = null;
+let PlayerFace = null;
 
-const chatSchema = new mongoose.Schema({
-  username: String,
-  chat: String,
-  timestamp: { type: Date, default: Date.now }
-});
-const MinecraftChat = mongoose.model('MinecraftChat', chatSchema);
-
-const playerFaceSchema = new mongoose.Schema({
-  username: { type: String, unique: true },
-  face: String,
-  isCustom: { type: Boolean, default: false },
-  lastUpdated: { type: Date, default: Date.now }
-});
-const PlayerFace = mongoose.model('PlayerFace', playerFaceSchema);
-
-function clearAllIntervals() {
-  if (actionSchedulerTimeout) {
-    clearTimeout(actionSchedulerTimeout);
-    actionSchedulerTimeout = null;
+async function connectDatabase() {
+  if (!MONGO_URI) {
+    console.log('⚠️  No MONGO_URI set — database features disabled');
+    return;
   }
-  if (reconnectTimeout) {
-    clearTimeout(reconnectTimeout);
-    reconnectTimeout = null;
+  try {
+    await mongoose.connect(MONGO_URI, {
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS: 45000,
+    });
+    console.log('✅ MongoDB connected');
+    dbConnected = true;
+
+    const chatSchema = new mongoose.Schema({
+      username:  String,
+      chat:      String,
+      timestamp: { type: Date, default: Date.now },
+    });
+    MinecraftChat = mongoose.model('MinecraftChat', chatSchema);
+
+    const playerFaceSchema = new mongoose.Schema({
+      username:    { type: String, unique: true },
+      face:        String,
+      isCustom:    { type: Boolean, default: false },
+      lastUpdated: { type: Date, default: Date.now },
+    });
+    PlayerFace = mongoose.model('PlayerFace', playerFaceSchema);
+  } catch (err) {
+    console.error('❌ MongoDB connection error:', err.message);
+    console.log('⚠️  Continuing without database...');
   }
-  if (activityCheckTimeout) {
-    clearInterval(activityCheckTimeout);
-    activityCheckTimeout = null;
+}
+
+// ============================================================================
+// 📊 BOT STATE
+// ============================================================================
+let bot                = null;
+let botReady           = false;  // true ONLY when bot is spawned and confirmed alive
+let isBotOnline        = false;
+let isInSpectatorMode  = false;
+let isTimeFrozen       = false;
+let isShuttingDown     = false;
+let botStartTime       = null;
+let lastOnlineTime     = null;
+let movementCount      = 0;
+let consecutiveFailures = 0;
+let otherPlayersOnline = 0;
+let mistakeCounter     = 0;
+let spawnTimeoutHandle = null;
+
+// Nearby players cache
+let nearbyPlayers      = [];
+let lastPlayerCheckMs  = 0;
+
+// Behavior phase: 'active' | 'moderate' | 'idle'
+let behaviorPhase      = 'active';
+
+// Scheduler handles
+let actionSchedulerHandle  = null;
+let activityCheckHandle    = null;
+let reconnectHandle        = null;
+
+// Action guard — prevents ghost actions
+let actionInProgress   = false;
+let currentAction      = null;
+
+// CPU tracking
+let lastCpuSnapshot    = { idle: 0, total: 0 };
+
+// Face index for dot-usernames
+let nextDotFaceIndex   = 0;
+
+// Current server info (for display)
+let currentServerHost  = BOT_HOST;
+let currentServerPort  = BOT_PORT;
+
+// ============================================================================
+// 🛡️ SAFETY GUARD — the single source of truth for "can we act?"
+// ============================================================================
+function canAct() {
+  return (
+    botReady         &&
+    isBotOnline      &&
+    bot              !== null &&
+    bot.entity       !== null &&
+    !isShuttingDown
+  );
+}
+
+function canActSpectator() {
+  return canAct() && isInSpectatorMode;
+}
+
+// ============================================================================
+// 🔄 STATE HELPERS
+// ============================================================================
+function clearAllHandles() {
+  if (actionSchedulerHandle) {
+    clearTimeout(actionSchedulerHandle);
+    actionSchedulerHandle = null;
+  }
+  if (reconnectHandle) {
+    clearTimeout(reconnectHandle);
+    reconnectHandle = null;
+  }
+  if (activityCheckHandle) {
+    clearInterval(activityCheckHandle);
+    activityCheckHandle = null;
+  }
+  if (spawnTimeoutHandle) {
+    clearTimeout(spawnTimeoutHandle);
+    spawnTimeoutHandle = null;
   }
   actionInProgress = false;
-  currentAction = null;
+  currentAction    = null;
 }
 
 function resetBotState() {
-  isBotOnline = false;
-  botStartTime = null;
-  movementCount = 0;
-  isTimeFrozen = false;
+  isBotOnline        = false;
+  botReady           = false;
+  isInSpectatorMode  = false;
+  isTimeFrozen       = false;
+  botStartTime       = null;
+  movementCount      = 0;
+  behaviorPhase      = 'active';
+  nearbyPlayers      = [];
+  mistakeCounter     = 0;
   otherPlayersOnline = 0;
-  behaviorPhase = 'active';
-  nearbyPlayers = [];
-  mistakeCounter = 0;
-  isInSpectatorMode = false;
+  actionInProgress   = false;
+  currentAction      = null;
 }
 
-async function sendDiscordEmbed(title, description, color = DEFAULT_EMBED_COLOR, fields = []) {
+// ============================================================================
+// 📡 DISCORD WEBHOOKS
+// ============================================================================
+async function sendDiscordEmbed(title, description, color = DEFAULT_COLOR, fields = []) {
   if (!DISCORD_WEBHOOK) return;
   try {
     await axios.post(DISCORD_WEBHOOK, {
       embeds: [{ title, description, color, fields, timestamp: new Date().toISOString() }],
-    });
+    }, { timeout: 8000 });
   } catch (err) {
     console.error('❌ Discord Webhook Error:', err.message);
   }
 }
 
-async function sendChatEmbed(title, description, color = SUCCESS_EMBED_COLOR, fields = []) {
+async function sendChatEmbed(title, description, color = SUCCESS_COLOR, fields = []) {
   if (!CHAT_WEBHOOK) return;
   try {
     await axios.post(CHAT_WEBHOOK, {
       embeds: [{ title, description, color, fields, timestamp: new Date().toISOString() }],
-    });
+    }, { timeout: 8000 });
   } catch (err) {
     console.error('❌ Chat Webhook Error:', err.message);
   }
 }
 
 async function sendPlayerMessage(username, message) {
-  if (username === botOptions.username || !MESSAGE_WEBHOOK) return;
+  if (username === BOT_USERNAME || !MESSAGE_WEBHOOK) return;
   try {
     await axios.post(MESSAGE_WEBHOOK, {
-      content: `💬 **${username}**: ${message}`
-    });
+      content: `💬 **${username}**: ${message}`,
+    }, { timeout: 8000 });
   } catch (err) {
     console.error('❌ Message Webhook Error:', err.message);
   }
 }
 
+// ============================================================================
+// 👥 PLAYER HELPERS
+// ============================================================================
 function getOnlinePlayersExcludingBot() {
-  if (!bot || !bot.players || !isBotOnline) {
-    return [];
-  }
-  return Object.values(bot.players).filter(p => p.username !== botOptions.username);
+  if (!bot || !bot.players || !canAct()) return [];
+  return Object.values(bot.players).filter(p => p.username !== BOT_USERNAME);
 }
 
-// Check for spectator mode
 function updateSpectatorMode() {
   if (!bot || !bot.game) return;
-  isInSpectatorMode = bot.game.gameMode === 'spectator' || bot.game.gameMode === 3;
+  const gm = bot.game.gameMode;
+  isInSpectatorMode = (gm === 'spectator' || gm === 3);
+  if (isInSpectatorMode) {
+    console.log('👻 Confirmed in SPECTATOR mode — movement engine armed');
+  }
 }
 
-// Get nearby players within render distance
-function getNearbyPlayers(radius = 50) {
-  if (!bot || !bot.entity || !bot.players) return [];
-  
+function getNearbyPlayers(radius = 64) {
+  if (!canAct() || !bot.players) return [];
   const botPos = bot.entity.position;
   const nearby = [];
-  
   Object.values(bot.players).forEach(player => {
-    if (player.username === botOptions.username) return;
+    if (player.username === BOT_USERNAME) return;
     if (!player.entity) return;
-    
-    const distance = botPos.distanceTo(player.entity.position);
-    if (distance <= radius) {
-      nearby.push({
-        username: player.username,
-        distance: distance,
-        position: player.entity.position
-      });
+    const dist = botPos.distanceTo(player.entity.position);
+    if (dist <= radius) {
+      nearby.push({ username: player.username, distance: dist, position: player.entity.position });
     }
   });
-  
   return nearby;
 }
 
-// Update nearby players periodically
-function checkNearbyPlayers() {
-  if (!bot || !isBotOnline) return;
-  
+function refreshNearbyPlayers() {
+  if (!canAct()) return;
   const now = Date.now();
-  if (now - lastPlayerCheckTime > 3000) {
+  if (now - lastPlayerCheckMs > 3000) {
     nearbyPlayers = getNearbyPlayers();
-    lastPlayerCheckTime = now;
+    lastPlayerCheckMs = now;
   }
 }
 
-// Determine behavior phase based on uptime
 function updateBehaviorPhase() {
   if (!botStartTime) return;
-  
-  const uptime = (Date.now() - botStartTime) / 1000 / 60; // minutes
-  
-  if (uptime < 10) {
-    behaviorPhase = 'active';
-  } else if (uptime < 30) {
-    behaviorPhase = 'moderate';
-  } else {
-    behaviorPhase = 'idle';
-  }
+  const minutes = (Date.now() - botStartTime) / 60000;
+  if (minutes < 10)       behaviorPhase = 'active';
+  else if (minutes < 30)  behaviorPhase = 'moderate';
+  else                    behaviorPhase = 'idle';
 }
 
+// ============================================================================
+// ⏰ TIME FREEZE / UNFREEZE
+// ============================================================================
 async function freezeTime() {
-  if (!bot || !isBotOnline || isTimeFrozen) return;
+  if (!canAct() || isTimeFrozen) return;
   try {
     bot.chat('/tick freeze');
     isTimeFrozen = true;
-    console.log('⏸️  Time frozen - Bot is alone on the server');
-    await sendDiscordEmbed('Time Control', 'Time frozen - Bot is the only player online', INFO_EMBED_COLOR);
+    console.log('⏸️  Time frozen — bot is alone');
+    await sendDiscordEmbed('Time Control', 'Time frozen — bot is the only player', INFO_COLOR);
   } catch (err) {
     console.error('❌ Error freezing time:', err.message);
   }
 }
 
 async function unfreezeTime() {
-  if (!bot || !isBotOnline || !isTimeFrozen) return;
+  if (!canAct() || !isTimeFrozen) return;
   try {
     bot.chat('/tick unfreeze');
     isTimeFrozen = false;
-    console.log('▶️  Time unfrozen - Other players joined');
-    await sendDiscordEmbed('Time Control', 'Time unfrozen - Other players online', INFO_EMBED_COLOR);
+    console.log('▶️  Time unfrozen — other players joined');
+    await sendDiscordEmbed('Time Control', 'Time unfrozen — players online', INFO_COLOR);
   } catch (err) {
     console.error('❌ Error unfreezing time:', err.message);
   }
@@ -267,19 +332,15 @@ async function ensureTimeUnfrozen() {
       bot.chat('/tick unfreeze');
       isTimeFrozen = false;
       console.log('✅ Time unfrozen before disconnect');
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    } catch (err) {
-      console.error('❌ Error ensuring time unfrozen:', err.message);
-    }
+      await new Promise(r => setTimeout(r, 800));
+    } catch (_) {}
   }
 }
 
 function checkPlayerCount() {
-  if (!bot || !AUTO_TIME_FREEZE || !isBotOnline) return;
-
+  if (!bot || !AUTO_TIME_FREEZE || !canAct()) return;
   const players = getOnlinePlayersExcludingBot();
   otherPlayersOnline = players.length;
-
   if (otherPlayersOnline === 0 && !isTimeFrozen) {
     setTimeout(() => freezeTime(), 2000);
   } else if (otherPlayersOnline > 0 && isTimeFrozen) {
@@ -287,1852 +348,1484 @@ function checkPlayerCount() {
   }
 }
 
-function sendPlayerList() {
-  if (!bot || !bot.players || !isBotOnline) return;
+// ============================================================================
+// 🎮 SPECTATOR MOVEMENT ENGINE
+// All movements are strictly spectator-mode only.
+// Uses bot.look() and bot.setControlState() — these are mineflayer's actual
+// high-level movement API that send real protocol packets to the server.
+// ============================================================================
+
+// --- Utility: sleep ---
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function sendBotStats() {
-  if (!bot || !isBotOnline) return;
-  try {
-    const uptime = botStartTime ? Math.floor((Date.now() - botStartTime) / 1000) : 0;
-    const hours = Math.floor(uptime / 3600);
-    const minutes = Math.floor((uptime % 3600) / 60);
-    const seconds = uptime % 60;
-    const uptimeStr = `${hours}h ${minutes}m ${seconds}s`;
-    
-    const position = bot.entity ? bot.entity.position : { x: 0, y: 0, z: 0 };
-    const posStr = `X: ${Math.floor(position.x)}, Y: ${Math.floor(position.y)}, Z: ${Math.floor(position.z)}`;
-    
-    const memoryUsage = process.memoryUsage();
-    const memoryStr = `${Math.round(memoryUsage.rss / 1024 / 1024 * 100) / 100} MB`;
-    const gameModeDisplay = bot?.game?.gameMode || 'N/A';
-    const onlinePlayersCount = getOnlinePlayersExcludingBot().length;
+// --- Utility: humanized random delay ---
+function humanDelay(min, max) {
+  const base     = min + Math.random() * (max - min);
+  const jitter   = base * 0.25 * (Math.random() - 0.5);
+  const spike    = Math.random() < 0.08 ? Math.random() * 800 : 0;
+  return Math.max(100, Math.floor(base + jitter + spike));
+}
 
-    sendDiscordEmbed('Bot Status Report', `Status report for ${botOptions.username}`, INFO_EMBED_COLOR, [
-      { name: 'Uptime', value: uptimeStr, inline: true },
-      { name: 'Position', value: posStr, inline: true },
-      { name: 'Game Mode', value: gameModeDisplay, inline: true },
-      { name: 'Memory Usage', value: memoryStr, inline: true },
-      { name: 'Movement Count', value: `${movementCount} moves`, inline: true },
-      { name: 'Players Online', value: `${onlinePlayersCount} (excluding bot)`, inline: true },
-      { name: 'Time Status', value: isTimeFrozen ? '⏸️ Frozen' : '▶️ Running', inline: true },
-      { name: 'Behavior Phase', value: behaviorPhase, inline: true }
-    ]);
-  } catch (err) {
-    console.error('❌ Error sending bot stats:', err.message);
+// --- Utility: smooth interpolated look (simulates real mouse movement) ---
+async function smoothLook(targetYaw, targetPitch, durationMs) {
+  if (!canAct()) return;
+  const startYaw   = bot.entity.yaw;
+  const startPitch = bot.entity.pitch;
+  const steps      = Math.max(4, Math.floor(durationMs / 50));
+  for (let i = 1; i <= steps; i++) {
+    if (!canAct()) break;
+    const t     = i / steps;
+    // ease-in-out cubic
+    const ease  = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    const yaw   = startYaw   + (targetYaw   - startYaw)   * ease;
+    const pitch = startPitch + (targetPitch - startPitch)  * ease;
+    bot.look(yaw, pitch, false);
+    await sleep(Math.floor(durationMs / steps));
+  }
+}
+
+// --- Utility: micro-drift (tiny random look wobble like a real player) ---
+async function microDrift(durationMs) {
+  const endTime = Date.now() + durationMs;
+  while (Date.now() < endTime && canAct()) {
+    if (Math.random() < 0.12) {
+      const yaw   = bot.entity.yaw   + (Math.random() - 0.5) * 0.08;
+      const pitch = bot.entity.pitch + (Math.random() - 0.5) * 0.04;
+      bot.look(yaw, pitch, false);
+    }
+    await sleep(200 + Math.random() * 300);
   }
 }
 
 // ============================================================================
-// 🎮 ENHANCED ACTION-BASED SCHEDULER - 40+ ACTIONS WITH ADVANCED BEHAVIOR
+// SPECTATOR ACTIONS — every single one checks canActSpectator()
 // ============================================================================
 
-const ACTIONS = {
-  // ========== MOVEMENT ACTIONS (Spectator-friendly) ==========
-  WALK_SHORT: { weight: 12, type: 'movement', category: 'basic' },
-  WALK_LONG: { weight: 8, type: 'movement', category: 'basic' },
-  WANDER: { weight: 7, type: 'movement', category: 'basic' },
-  SPRINT_TRAVEL: { weight: 4, type: 'movement', category: 'basic' },
-  JUMP_MOVE: { weight: 3, type: 'movement', category: 'basic' },
-  
-  // New movement variations
-  DIAGONAL_WALK: { weight: 5, type: 'movement', category: 'varied' },
-  ZIGZAG_MOVEMENT: { weight: 4, type: 'movement', category: 'varied' },
-  CIRCLE_WALK: { weight: 3, type: 'movement', category: 'varied' },
-  BACKWARDS_WALK: { weight: 3, type: 'movement', category: 'varied' },
-  STRAFE_LEFT_RIGHT: { weight: 4, type: 'movement', category: 'varied' },
-  
-  // ========== LOOKING ACTIONS ==========
-  LOOK_AROUND: { weight: 10, type: 'look', category: 'basic' },
-  LOOK_SLOWLY: { weight: 7, type: 'look', category: 'basic' },
-  LOOK_QUICK: { weight: 4, type: 'look', category: 'basic' },
-  
-  // New looking variations
-  LOOK_UP_DOWN: { weight: 5, type: 'look', category: 'varied' },
-  LOOK_AT_GROUND: { weight: 3, type: 'look', category: 'varied' },
-  LOOK_AT_SKY: { weight: 3, type: 'look', category: 'varied' },
-  SCAN_HORIZON: { weight: 4, type: 'look', category: 'varied' },
-  QUICK_HEAD_TURN: { weight: 3, type: 'look', category: 'varied' },
-  LOOK_BEHIND: { weight: 3, type: 'look', category: 'varied' },
-  
-  // ========== IDLE ACTIONS ==========
-  IDLE_SHORT: { weight: 8, type: 'idle', category: 'basic' },
-  IDLE_MEDIUM: { weight: 6, type: 'idle', category: 'basic' },
-  IDLE_LONG: { weight: 4, type: 'idle', category: 'basic' },
-  
-  // New idle variations
-  IDLE_WITH_MICRO_LOOK: { weight: 6, type: 'idle', category: 'varied' },
-  COMPLETE_STILLNESS: { weight: 5, type: 'idle', category: 'deep' },
-  AFK_SIMULATION: { weight: 3, type: 'idle', category: 'deep' },
-  
-  // ========== INTERACTIVE ACTIONS ==========
-  HOTBAR_SWITCH: { weight: 5, type: 'interaction', category: 'basic' },
-  SWING_ARM: { weight: 4, type: 'interaction', category: 'basic' },
-  SNEAK: { weight: 3, type: 'interaction', category: 'basic' },
-  JUMP_PLACE: { weight: 2, type: 'interaction', category: 'basic' },
-  
-  // New interaction variations
-  RAPID_HOTBAR_SCROLL: { weight: 3, type: 'interaction', category: 'varied' },
-  SNEAK_WALK: { weight: 3, type: 'interaction', category: 'varied' },
-  SNEAK_LOOK: { weight: 3, type: 'interaction', category: 'varied' },
-  DOUBLE_JUMP: { weight: 2, type: 'interaction', category: 'varied' },
-  TRIPLE_JUMP: { weight: 1, type: 'interaction', category: 'varied' },
-  CROUCH_SPAM: { weight: 2, type: 'interaction', category: 'varied' },
-  
-  // ========== BLOCK INTERACTION ACTIONS ==========
-  LOOK_AT_BLOCK: { weight: 4, type: 'block', category: 'interaction' },
-  APPROACH_BLOCK: { weight: 3, type: 'block', category: 'interaction' },
-  RIGHT_CLICK_AIR: { weight: 3, type: 'block', category: 'interaction' },
-  LEFT_CLICK_AIR: { weight: 2, type: 'block', category: 'interaction' },
-  SWING_AT_BLOCK: { weight: 2, type: 'block', category: 'interaction' },
-  
-  // ========== HUMAN MISTAKE ACTIONS ==========
-  WALK_INTO_WALL: { weight: 2, type: 'mistake', category: 'human' },
-  WRONG_DIRECTION: { weight: 2, type: 'mistake', category: 'human' },
-  SUDDEN_STOP: { weight: 3, type: 'mistake', category: 'human' },
-  ACCIDENTAL_JUMP: { weight: 2, type: 'mistake', category: 'human' },
-  HESITATION: { weight: 3, type: 'mistake', category: 'human' },
-  OVERCORRECTION: { weight: 2, type: 'mistake', category: 'human' },
-  
-  // ========== PLAYER-AWARE ACTIONS ==========
-  REACT_TO_PLAYER: { weight: 8, type: 'social', category: 'player-aware' },
-  LOOK_AT_PLAYER: { weight: 6, type: 'social', category: 'player-aware' },
-  FOLLOW_PLAYER: { weight: 3, type: 'social', category: 'player-aware' },
-  AVOID_PLAYER: { weight: 2, type: 'social', category: 'player-aware' },
-  CURIOUS_APPROACH: { weight: 3, type: 'social', category: 'player-aware' },
-  
-  // ========== ADVANCED COMBINATIONS ==========
-  JUMP_SPRINT_COMBO: { weight: 3, type: 'combo', category: 'advanced' },
-  SNEAK_JUMP_COMBO: { weight: 2, type: 'combo', category: 'advanced' },
-  STRAFE_LOOK_COMBO: { weight: 3, type: 'combo', category: 'advanced' },
-  WALK_LOOK_COMBO: { weight: 4, type: 'combo', category: 'advanced' },
-  
-  // ========== SPECTATOR-SPECIFIC ACTIONS ==========
-  SPECTATOR_FLOAT: { weight: 2, type: 'spectator', category: 'mode-specific' },
-  SPECTATOR_PHASE: { weight: 1, type: 'spectator', category: 'mode-specific' },
-};
-
-const TOTAL_WEIGHT = Object.values(ACTIONS).reduce((sum, action) => sum + action.weight, 0);
-
-function getRandomDelay(min, max) {
-  const baseDelay = min + Math.random() * (max - min);
-  const variance = baseDelay * 0.3 * (Math.random() - 0.5);
-  const spike = Math.random() < 0.1 ? Math.random() * 1000 : 0;
-  return Math.floor(baseDelay + variance + spike);
+// 1. Smooth look around (random direction)
+async function doLookAround() {
+  if (!canActSpectator()) return;
+  const turns = 1 + Math.floor(Math.random() * 3);
+  for (let i = 0; i < turns; i++) {
+    if (!canActSpectator()) break;
+    const yaw   = Math.random() * Math.PI * 2;
+    const pitch = (Math.random() - 0.5) * (Math.PI / 2.2);
+    await smoothLook(yaw, pitch, humanDelay(400, 1200));
+    await sleep(humanDelay(200, 600));
+  }
 }
 
-function selectRandomAction() {
-  // Adjust weights based on context
-  let adjustedActions = { ...ACTIONS };
-  
-  // If players nearby, increase social actions
-  if (nearbyPlayers.length > 0) {
-    Object.keys(adjustedActions).forEach(key => {
-      if (adjustedActions[key].category === 'player-aware') {
-        adjustedActions[key] = { ...adjustedActions[key], weight: adjustedActions[key].weight * 3 };
-      }
-    });
-  }
-  
-  // Adjust based on behavior phase
-  if (behaviorPhase === 'idle') {
-    Object.keys(adjustedActions).forEach(key => {
-      if (adjustedActions[key].type === 'idle') {
-        adjustedActions[key] = { ...adjustedActions[key], weight: adjustedActions[key].weight * 2 };
-      }
-      if (adjustedActions[key].type === 'movement') {
-        adjustedActions[key] = { ...adjustedActions[key], weight: adjustedActions[key].weight * 0.5 };
-      }
-    });
-  } else if (behaviorPhase === 'active') {
-    Object.keys(adjustedActions).forEach(key => {
-      if (adjustedActions[key].type === 'movement') {
-        adjustedActions[key] = { ...adjustedActions[key], weight: adjustedActions[key].weight * 1.5 };
-      }
-    });
-  }
-  
-  // Occasionally inject mistakes (5% chance)
-  if (Math.random() < 0.05) {
-    const mistakes = Object.keys(adjustedActions).filter(k => adjustedActions[k].category === 'human');
-    if (mistakes.length > 0) {
-      return mistakes[Math.floor(Math.random() * mistakes.length)];
-    }
-  }
-  
-  // Calculate total adjusted weight
-  const totalAdjustedWeight = Object.values(adjustedActions).reduce((sum, action) => sum + action.weight, 0);
-  
-  let random = Math.random() * totalAdjustedWeight;
-  
-  for (const [actionName, actionData] of Object.entries(adjustedActions)) {
-    random -= actionData.weight;
-    if (random <= 0) {
-      return actionName;
-    }
-  }
-  
-  return 'LOOK_AROUND';
+// 2. Slow pan (like a player carefully scanning)
+async function doSlowPan() {
+  if (!canActSpectator()) return;
+  const startYaw   = bot.entity.yaw;
+  const startPitch = bot.entity.pitch;
+  const sweepAngle = (Math.random() - 0.5) * Math.PI * 1.2;
+  const targetPitch = startPitch + (Math.random() - 0.5) * 0.3;
+  await smoothLook(startYaw + sweepAngle, targetPitch, humanDelay(1500, 3500));
+  await sleep(humanDelay(300, 800));
 }
 
-// ========== ACTION IMPLEMENTATIONS ==========
-
-// Basic Movement Actions
-async function executeWalkShort() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const directions = ['forward', 'back', 'left', 'right'];
-  const direction = directions[Math.floor(Math.random() * directions.length)];
-  
-  bot.setControlState(direction, true);
-  
-  if (Math.random() < 0.2) {
-    bot.setControlState('jump', true);
-  }
-  
-  const duration = getRandomDelay(300, 1200);
-  
-  await new Promise(resolve => setTimeout(resolve, duration));
-  
-  if (bot) {
-    bot.clearControlStates();
-  }
-  
-  movementCount++;
+// 3. Quick snap look
+async function doQuickLook() {
+  if (!canActSpectator()) return;
+  const yaw   = Math.random() * Math.PI * 2;
+  const pitch = (Math.random() - 0.5) * 0.8;
+  bot.look(yaw, pitch, false);
+  await sleep(humanDelay(80, 200));
 }
 
-async function executeWalkLong() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const directions = ['forward', 'back', 'left', 'right'];
-  const direction = directions[Math.floor(Math.random() * directions.length)];
-  
-  bot.setControlState(direction, true);
-  
-  if (Math.random() < 0.3) {
-    bot.setControlState('sprint', true);
-  }
-  
-  const duration = getRandomDelay(1500, 4000);
-  
-  const jumpInterval = setInterval(() => {
-    if (bot && Math.random() < 0.15) {
-      bot.setControlState('jump', true);
-      setTimeout(() => {
-        if (bot) bot.setControlState('jump', false);
-      }, 300);
-    }
-  }, 800);
-  
-  await new Promise(resolve => setTimeout(resolve, duration));
-  
-  clearInterval(jumpInterval);
-  
-  if (bot) {
-    bot.clearControlStates();
-  }
-  
-  movementCount++;
+// 4. Look up / look at sky
+async function doLookAtSky() {
+  if (!canActSpectator()) return;
+  const yaw = bot.entity.yaw + (Math.random() - 0.5) * 0.4;
+  await smoothLook(yaw, -(0.9 + Math.random() * 0.6), humanDelay(500, 1200));
+  await sleep(humanDelay(1000, 3000));
+  if (!canActSpectator()) return;
+  await smoothLook(bot.entity.yaw, 0, humanDelay(400, 900));
 }
 
-async function executeWander() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const totalDuration = getRandomDelay(3000, 8000);
-  const startTime = Date.now();
-  
-  while (Date.now() - startTime < totalDuration && bot && isBotOnline) {
-    const directions = ['forward', 'back', 'left', 'right'];
-    const direction = directions[Math.floor(Math.random() * directions.length)];
-    
-    bot.clearControlStates();
-    bot.setControlState(direction, true);
-    
-    if (Math.random() < 0.4) {
-      bot.setControlState('sprint', true);
-    }
-    
-    if (Math.random() < 0.3) {
-      const yaw = Math.random() * Math.PI * 2;
-      const pitch = (Math.random() - 0.5) * Math.PI / 4;
-      bot.look(yaw, pitch, true);
-    }
-    
-    const segmentDuration = getRandomDelay(500, 2000);
-    await new Promise(resolve => setTimeout(resolve, segmentDuration));
-    
-    if (Math.random() < 0.2) {
-      bot.setControlState('jump', true);
-      await new Promise(resolve => setTimeout(resolve, 300));
-      if (bot) bot.setControlState('jump', false);
-    }
-  }
-  
-  if (bot) {
-    bot.clearControlStates();
-  }
-  
-  movementCount++;
+// 5. Look at ground
+async function doLookAtGround() {
+  if (!canActSpectator()) return;
+  const yaw = bot.entity.yaw + (Math.random() - 0.5) * 0.3;
+  await smoothLook(yaw, 0.9 + Math.random() * 0.5, humanDelay(400, 1000));
+  await sleep(humanDelay(800, 2500));
 }
 
-async function executeSprintTravel() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
+// 6. Scan horizon (wide sweep left to right)
+async function doScanHorizon() {
+  if (!canActSpectator()) return;
+  const startYaw  = bot.entity.yaw;
+  const sweepSize = Math.PI * (0.6 + Math.random() * 0.8);
+  const steps     = 10 + Math.floor(Math.random() * 8);
+  for (let i = 0; i <= steps; i++) {
+    if (!canActSpectator()) break;
+    const t   = i / steps;
+    const yaw = startYaw - sweepSize / 2 + sweepSize * t;
+    bot.look(yaw, (Math.random() - 0.5) * 0.15, false);
+    await sleep(humanDelay(80, 200));
+  }
+}
+
+// 7. Look behind
+async function doLookBehind() {
+  if (!canActSpectator()) return;
+  const startYaw = bot.entity.yaw;
+  await smoothLook(startYaw + Math.PI, 0, humanDelay(300, 600));
+  await sleep(humanDelay(600, 2000));
+  if (!canActSpectator()) return;
+  await smoothLook(startYaw, 0, humanDelay(300, 600));
+}
+
+// 8. Fly forward (spectator noclip)
+async function doFlyForward() {
+  if (!canActSpectator()) return;
   const yaw = Math.random() * Math.PI * 2;
-  bot.look(yaw, 0, true);
-  
+  await smoothLook(yaw, (Math.random() - 0.5) * 0.4, humanDelay(200, 500));
+  if (!canActSpectator()) return;
+
+  bot.setControlState('forward', true);
+  const duration = humanDelay(800, 3500);
+  const endTime  = Date.now() + duration;
+
+  while (Date.now() < endTime && canActSpectator()) {
+    // Occasionally adjust look mid-flight (like a real player steering)
+    if (Math.random() < 0.15) {
+      const curYaw   = bot.entity.yaw;
+      const curPitch = bot.entity.pitch;
+      bot.look(curYaw + (Math.random() - 0.5) * 0.12, curPitch + (Math.random() - 0.5) * 0.08, false);
+    }
+    await sleep(100);
+  }
+
+  bot.clearControlStates();
+  movementCount++;
+}
+
+// 9. Fly backward
+async function doFlyBackward() {
+  if (!canActSpectator()) return;
+  bot.setControlState('back', true);
+  await sleep(humanDelay(500, 2000));
+  if (bot) bot.clearControlStates();
+  movementCount++;
+}
+
+// 10. Sprint fly (fast forward)
+async function doSprintFly() {
+  if (!canActSpectator()) return;
+  const yaw = Math.random() * Math.PI * 2;
+  await smoothLook(yaw, (Math.random() - 0.5) * 0.3, humanDelay(200, 400));
+  if (!canActSpectator()) return;
+
+  bot.setControlState('sprint', true);
+  bot.setControlState('forward', true);
+  const duration = humanDelay(1500, 5000);
+  const endTime  = Date.now() + duration;
+
+  while (Date.now() < endTime && canActSpectator()) {
+    if (Math.random() < 0.1) {
+      bot.look(bot.entity.yaw + (Math.random() - 0.5) * 0.15, bot.entity.pitch + (Math.random() - 0.5) * 0.1, false);
+    }
+    await sleep(100);
+  }
+
+  bot.clearControlStates();
+  movementCount++;
+}
+
+// 11. Fly up (spectator: look up + forward = ascend)
+async function doFlyUp() {
+  if (!canActSpectator()) return;
+  const pitch = -(0.6 + Math.random() * 0.9); // look up
+  await smoothLook(bot.entity.yaw, pitch, humanDelay(300, 700));
+  if (!canActSpectator()) return;
+
+  bot.setControlState('forward', true);
+  await sleep(humanDelay(600, 2500));
+  bot.clearControlStates();
+
+  // Level out
+  if (canActSpectator()) {
+    await smoothLook(bot.entity.yaw, 0, humanDelay(300, 600));
+  }
+  movementCount++;
+}
+
+// 12. Fly down (spectator: look down + forward = descend)
+async function doFlyDown() {
+  if (!canActSpectator()) return;
+  const pitch = 0.6 + Math.random() * 0.9; // look down
+  await smoothLook(bot.entity.yaw, pitch, humanDelay(300, 700));
+  if (!canActSpectator()) return;
+
+  bot.setControlState('forward', true);
+  await sleep(humanDelay(600, 2000));
+  bot.clearControlStates();
+
+  if (canActSpectator()) {
+    await smoothLook(bot.entity.yaw, 0, humanDelay(300, 600));
+  }
+  movementCount++;
+}
+
+// 13. Float up using jump key (spectator)
+async function doFloatUp() {
+  if (!canActSpectator()) return;
+  bot.setControlState('jump', true);
+  await sleep(humanDelay(500, 2000));
+  bot.clearControlStates();
+  movementCount++;
+}
+
+// 14. Float down using sneak key (spectator)
+async function doFloatDown() {
+  if (!canActSpectator()) return;
+  bot.setControlState('sneak', true);
+  await sleep(humanDelay(500, 1800));
+  bot.clearControlStates();
+  movementCount++;
+}
+
+// 15. Strafe left / right
+async function doStrafe() {
+  if (!canActSpectator()) return;
+  const side = Math.random() < 0.5 ? 'left' : 'right';
+  bot.setControlState(side, true);
+  await sleep(humanDelay(400, 2000));
+  bot.clearControlStates();
+  movementCount++;
+}
+
+// 16. Zigzag flight (alternating strafes while moving forward)
+async function doZigzagFly() {
+  if (!canActSpectator()) return;
+  const yaw = Math.random() * Math.PI * 2;
+  await smoothLook(yaw, (Math.random() - 0.5) * 0.2, humanDelay(200, 400));
+  if (!canActSpectator()) return;
+
+  const legs = 3 + Math.floor(Math.random() * 3);
+  for (let i = 0; i < legs; i++) {
+    if (!canActSpectator()) break;
+    bot.clearControlStates();
+    bot.setControlState('forward', true);
+    bot.setControlState(i % 2 === 0 ? 'left' : 'right', true);
+    await sleep(humanDelay(400, 900));
+  }
+  bot.clearControlStates();
+  movementCount++;
+}
+
+// 17. Diagonal fly
+async function doDiagonalFly() {
+  if (!canActSpectator()) return;
+  const combos = [['forward','left'],['forward','right'],['back','left'],['back','right']];
+  const combo  = combos[Math.floor(Math.random() * combos.length)];
+  combo.forEach(d => bot.setControlState(d, true));
+  await sleep(humanDelay(700, 2500));
+  bot.clearControlStates();
+  movementCount++;
+}
+
+// 18. Circle fly (forward + slowly rotate yaw)
+async function doCircleFly() {
+  if (!canActSpectator()) return;
+  const duration = humanDelay(3000, 7000);
+  const endTime  = Date.now() + duration;
+  bot.setControlState('forward', true);
+  while (Date.now() < endTime && canActSpectator()) {
+    const yaw = bot.entity.yaw + (Math.PI / 180) * (4 + Math.random() * 3);
+    bot.look(yaw, bot.entity.pitch, false);
+    await sleep(80);
+  }
+  bot.clearControlStates();
+  movementCount++;
+}
+
+// 19. Short idle (complete stillness)
+async function doIdleShort() {
+  if (!canActSpectator()) return;
+  bot.clearControlStates();
+  await sleep(humanDelay(500, 2500));
+}
+
+// 20. Medium idle (stillness with micro eye drift)
+async function doIdleMedium() {
+  if (!canActSpectator()) return;
+  bot.clearControlStates();
+  await microDrift(humanDelay(2000, 6000));
+}
+
+// 21. Long idle (true AFK simulation)
+async function doIdleLong() {
+  if (!canActSpectator()) return;
+  bot.clearControlStates();
+  const dur = humanDelay(8000, 20000);
+  console.log(`💤 Long idle for ${Math.floor(dur / 1000)}s`);
+  await microDrift(dur);
+}
+
+// 22. Swing arm
+async function doSwingArm() {
+  if (!canActSpectator()) return;
+  const swings = 1 + Math.floor(Math.random() * 3);
+  for (let i = 0; i < swings; i++) {
+    if (!canActSpectator()) break;
+    bot.swingArm('right');
+    await sleep(humanDelay(100, 400));
+  }
+  movementCount++;
+}
+
+// 23. Hotbar switch
+async function doHotbarSwitch() {
+  if (!canActSpectator()) return;
+  try {
+    const current = bot.quickBarSlot || 0;
+    const switches = 1 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < switches; i++) {
+      if (!canActSpectator()) break;
+      let slot = Math.floor(Math.random() * 9);
+      if (slot === current) slot = (slot + 1) % 9;
+      bot.setQuickBarSlot(slot);
+      await sleep(humanDelay(80, 450));
+    }
+  } catch (_) {}
+}
+
+// 24. Rapid hotbar scroll
+async function doHotbarScroll() {
+  if (!canActSpectator()) return;
+  try {
+    for (let i = 0; i < 9 && canActSpectator(); i++) {
+      bot.setQuickBarSlot(i);
+      await sleep(humanDelay(40, 120));
+    }
+  } catch (_) {}
+}
+
+// 25. Phase through blocks (fly straight, spectator noclip)
+async function doPhaseThrough() {
+  if (!canActSpectator()) return;
+  const yaw = Math.random() * Math.PI * 2;
+  bot.look(yaw, (Math.random() - 0.5) * 0.3, false);
+  bot.setControlState('forward', true);
+  await sleep(humanDelay(1000, 3500));
+  bot.clearControlStates();
+  movementCount++;
+  console.log('👻 Spectator: phased through blocks');
+}
+
+// 26. Orbit a spot (circle around current position)
+async function doOrbitFly() {
+  if (!canActSpectator()) return;
+  const startYaw = bot.entity.yaw;
+  const speed    = Math.PI / 180 * (3 + Math.random() * 4);
+  const duration = humanDelay(4000, 9000);
+  const endTime  = Date.now() + duration;
+
+  bot.setControlState('forward', true);
+  bot.setControlState('left', true);
+
+  while (Date.now() < endTime && canActSpectator()) {
+    const yaw = bot.entity.yaw + speed;
+    bot.look(yaw, bot.entity.pitch, false);
+    await sleep(80);
+  }
+  bot.clearControlStates();
+  movementCount++;
+}
+
+// 27. Look at player (if nearby)
+async function doLookAtPlayer() {
+  if (!canActSpectator() || nearbyPlayers.length === 0) return;
+  const player  = nearbyPlayers[Math.floor(Math.random() * nearbyPlayers.length)];
+  const botPos  = bot.entity.position;
+  const pPos    = player.position;
+  const yaw     = Math.atan2(-(pPos.x - botPos.x), pPos.z - botPos.z);
+  const dist    = botPos.distanceTo(pPos);
+  const pitch   = -Math.atan2(pPos.y - botPos.y, dist);
+  await smoothLook(yaw, pitch, humanDelay(400, 1000));
+  await sleep(humanDelay(1500, 5000));
+}
+
+// 28. Fly toward a player briefly
+async function doFlyTowardPlayer() {
+  if (!canActSpectator() || nearbyPlayers.length === 0) return;
+  const player  = nearbyPlayers[0];
+  const botPos  = bot.entity.position;
+  const pPos    = player.position;
+  const yaw     = Math.atan2(-(pPos.x - botPos.x), pPos.z - botPos.z);
+  await smoothLook(yaw, 0, humanDelay(300, 700));
+  if (!canActSpectator()) return;
+  bot.setControlState('forward', true);
+  await sleep(humanDelay(1500, 4000));
+  bot.clearControlStates();
+  movementCount++;
+}
+
+// 29. Fly away from player
+async function doFlyAwayFromPlayer() {
+  if (!canActSpectator() || nearbyPlayers.length === 0) return;
+  const player = nearbyPlayers[0];
+  const botPos = bot.entity.position;
+  const pPos   = player.position;
+  // Opposite direction
+  const yaw    = Math.atan2(-(pPos.x - botPos.x), pPos.z - botPos.z) + Math.PI;
+  await smoothLook(yaw, 0, humanDelay(300, 700));
+  if (!canActSpectator()) return;
+  bot.setControlState('forward', true);
+  await sleep(humanDelay(1000, 3000));
+  bot.clearControlStates();
+  movementCount++;
+}
+
+// 30. Human mistake: wrong direction correction
+async function doWrongDirection() {
+  if (!canActSpectator()) return;
+  console.log('🤦 Mistake: wrong direction');
+  bot.setControlState('forward', true);
+  await sleep(humanDelay(400, 800));
+  bot.clearControlStates();
+  await sleep(humanDelay(300, 600));
+  // Correct
+  if (!canActSpectator()) return;
+  const newYaw = bot.entity.yaw + Math.PI + (Math.random() - 0.5) * 0.4;
+  await smoothLook(newYaw, 0, humanDelay(200, 400));
+  bot.setControlState('forward', true);
+  await sleep(humanDelay(600, 1200));
+  bot.clearControlStates();
+  movementCount++;
+  mistakeCounter++;
+}
+
+// 31. Human mistake: sudden stop
+async function doSuddenStop() {
+  if (!canActSpectator()) return;
+  console.log('🤦 Mistake: sudden stop');
   bot.setControlState('forward', true);
   bot.setControlState('sprint', true);
-  
-  const duration = getRandomDelay(2000, 6000);
-  
-  const jumpInterval = setInterval(() => {
-    if (bot && Math.random() < 0.25) {
-      bot.setControlState('jump', true);
-    }
-  }, 1000);
-  
-  await new Promise(resolve => setTimeout(resolve, duration));
-  
-  clearInterval(jumpInterval);
-  
-  if (bot) {
-    bot.clearControlStates();
-  }
-  
+  await sleep(humanDelay(800, 2000));
+  bot.clearControlStates();
+  await sleep(humanDelay(1000, 3500));
   movementCount++;
+  mistakeCounter++;
 }
 
-async function executeJumpMove() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  if (Math.random() < 0.5) {
-    const directions = ['forward', 'back', 'left', 'right'];
-    const direction = directions[Math.floor(Math.random() * directions.length)];
-    bot.setControlState(direction, true);
-  }
-  
-  bot.setControlState('jump', true);
-  
-  await new Promise(resolve => setTimeout(resolve, 500));
-  
-  if (bot) {
-    bot.clearControlStates();
-  }
-  
-  movementCount++;
-}
-
-// New Movement Variations
-async function executeDiagonalWalk() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const combos = [
-    ['forward', 'left'],
-    ['forward', 'right'],
-    ['back', 'left'],
-    ['back', 'right']
-  ];
-  
-  const combo = combos[Math.floor(Math.random() * combos.length)];
-  
-  combo.forEach(dir => bot.setControlState(dir, true));
-  
-  const duration = getRandomDelay(800, 2500);
-  await new Promise(resolve => setTimeout(resolve, duration));
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-async function executeZigzagMovement() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const iterations = 3 + Math.floor(Math.random() * 3);
-  
-  for (let i = 0; i < iterations && bot && isBotOnline; i++) {
-    bot.clearControlStates();
-    
-    bot.setControlState('forward', true);
-    bot.setControlState(i % 2 === 0 ? 'left' : 'right', true);
-    
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(400, 800)));
-  }
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-async function executeCircleWalk() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const duration = getRandomDelay(3000, 6000);
-  const startTime = Date.now();
-  
+// 32. Human mistake: hesitation
+async function doHesitation() {
+  if (!canActSpectator()) return;
+  console.log('🤦 Mistake: hesitation');
   bot.setControlState('forward', true);
-  
-  while (Date.now() - startTime < duration && bot && isBotOnline) {
-    const currentYaw = bot.entity.yaw;
-    const newYaw = currentYaw + (Math.PI / 180) * 5; // 5 degrees per step
-    bot.look(newYaw, 0, true);
-    
-    await new Promise(resolve => setTimeout(resolve, 100));
+  await sleep(humanDelay(200, 500));
+  bot.clearControlStates();
+  await sleep(humanDelay(400, 1000));
+  if (!canActSpectator()) return;
+  bot.setControlState('forward', true);
+  await sleep(humanDelay(400, 900));
+  bot.clearControlStates();
+  movementCount++;
+  mistakeCounter++;
+}
+
+// 33. Human mistake: overcorrect look
+async function doOvercorrectLook() {
+  if (!canActSpectator()) return;
+  console.log('🤦 Mistake: overcorrect');
+  const startYaw = bot.entity.yaw;
+  await smoothLook(startYaw + Math.PI / 2.5, 0, humanDelay(150, 300));
+  await sleep(100);
+  if (!canActSpectator()) return;
+  await smoothLook(startYaw - Math.PI / 8, 0, humanDelay(150, 300));
+  await sleep(100);
+  if (!canActSpectator()) return;
+  await smoothLook(startYaw + (Math.random() - 0.5) * 0.3, 0, humanDelay(200, 400));
+  mistakeCounter++;
+}
+
+// 34. Fly in a figure-8 pattern
+async function doFigureEightFly() {
+  if (!canActSpectator()) return;
+  const startYaw = bot.entity.yaw;
+  bot.setControlState('forward', true);
+  for (let i = 0; i < 120 && canActSpectator(); i++) {
+    // sin wave on yaw to create figure-8 pattern
+    const yaw = startYaw + Math.sin(i * Math.PI / 30) * (Math.PI / 3);
+    bot.look(yaw, 0, false);
+    await sleep(80);
   }
-  
-  if (bot) bot.clearControlStates();
+  bot.clearControlStates();
   movementCount++;
 }
 
-async function executeBackwardsWalk() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.setControlState('back', true);
-  
-  const duration = getRandomDelay(1000, 3000);
-  await new Promise(resolve => setTimeout(resolve, duration));
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
+// 35. Look at coordinate (random block simulation)
+async function doLookAtCoord() {
+  if (!canActSpectator()) return;
+  const botPos = bot.entity.position;
+  const tx = botPos.x + (Math.random() - 0.5) * 20;
+  const ty = botPos.y + (Math.random() - 0.5) * 10;
+  const tz = botPos.z + (Math.random() - 0.5) * 20;
+  const dx = tx - botPos.x;
+  const dz = tz - botPos.z;
+  const dy = ty - botPos.y;
+  const dist = Math.sqrt(dx * dx + dz * dz);
+  const yaw  = Math.atan2(-dx, dz);
+  const pitch = -Math.atan2(dy, dist);
+  await smoothLook(yaw, pitch, humanDelay(400, 1200));
+  await sleep(humanDelay(1000, 4000));
 }
 
-async function executeStrafeLeftRight() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const iterations = 2 + Math.floor(Math.random() * 3);
-  
-  for (let i = 0; i < iterations && bot && isBotOnline; i++) {
-    bot.clearControlStates();
-    bot.setControlState(i % 2 === 0 ? 'left' : 'right', true);
-    
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(500, 1200)));
-  }
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-// Looking Actions
-async function executeLookAround() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const numLooks = 1 + Math.floor(Math.random() * 3);
-  
-  for (let i = 0; i < numLooks; i++) {
-    if (!bot || !isBotOnline) break;
-    
-    const yaw = Math.random() * Math.PI * 2;
-    const pitch = (Math.random() - 0.5) * Math.PI / 2;
-    bot.look(yaw, pitch, true);
-    
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(300, 1000)));
-  }
-}
-
-async function executeLookSlowly() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const currentYaw = bot.entity.yaw;
-  const currentPitch = bot.entity.pitch;
-  
-  const targetYaw = currentYaw + (Math.random() - 0.5) * Math.PI;
-  const targetPitch = (Math.random() - 0.5) * Math.PI / 3;
-  
-  const steps = 5 + Math.floor(Math.random() * 5);
-  for (let i = 0; i <= steps; i++) {
-    if (!bot || !isBotOnline) break;
-    
-    const progress = i / steps;
-    const yaw = currentYaw + (targetYaw - currentYaw) * progress;
-    const pitch = currentPitch + (targetPitch - currentPitch) * progress;
-    
-    bot.look(yaw, pitch, true);
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(50, 150)));
-  }
-}
-
-async function executeLookQuick() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
+// 36. Approach a coordinate then look around (exploration simulation)
+async function doExplore() {
+  if (!canActSpectator()) return;
   const yaw = Math.random() * Math.PI * 2;
-  const pitch = (Math.random() - 0.5) * Math.PI / 4;
-  
-  bot.look(yaw, pitch, false);
-}
-
-// New Looking Variations
-async function executeLookUpDown() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const currentYaw = bot.entity.yaw;
-  
-  // Look up
-  bot.look(currentYaw, -Math.PI / 3, true);
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(500, 1200)));
-  
-  // Look down
-  if (bot && isBotOnline) {
-    bot.look(currentYaw, Math.PI / 4, true);
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(500, 1200)));
-  }
-  
-  // Return to normal
-  if (bot && isBotOnline) {
-    bot.look(currentYaw, 0, true);
-  }
-}
-
-async function executeLookAtGround() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const currentYaw = bot.entity.yaw;
-  bot.look(currentYaw, Math.PI / 3, true);
-  
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(1000, 3000)));
-}
-
-async function executeLookAtSky() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const currentYaw = bot.entity.yaw;
-  bot.look(currentYaw, -Math.PI / 2.5, true);
-  
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(1000, 3000)));
-}
-
-async function executeScanHorizon() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const currentYaw = bot.entity.yaw;
-  const sweepRange = Math.PI * 0.75;
-  const steps = 8;
-  
-  for (let i = 0; i <= steps && bot && isBotOnline; i++) {
-    const progress = i / steps;
-    const yaw = currentYaw - sweepRange / 2 + sweepRange * progress;
-    bot.look(yaw, 0, true);
-    
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(200, 500)));
-  }
-}
-
-async function executeQuickHeadTurn() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const currentYaw = bot.entity.yaw;
-  const turnAmount = (Math.random() - 0.5) * Math.PI;
-  
-  bot.look(currentYaw + turnAmount, 0, false);
-  await new Promise(resolve => setTimeout(resolve, 100));
-}
-
-async function executeLookBehind() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const currentYaw = bot.entity.yaw;
-  bot.look(currentYaw + Math.PI, 0, true);
-  
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(800, 2000)));
-  
-  if (bot && isBotOnline) {
-    bot.look(currentYaw, 0, true);
-  }
-}
-
-// Idle Actions
-async function executeIdleShort() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.clearControlStates();
-  const duration = getRandomDelay(500, 2000);
-  await new Promise(resolve => setTimeout(resolve, duration));
-}
-
-async function executeIdleMedium() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.clearControlStates();
-  const duration = getRandomDelay(2000, 5000);
-  
-  const lookInterval = setInterval(() => {
-    if (bot && Math.random() < 0.3) {
-      const yaw = bot.entity.yaw + (Math.random() - 0.5) * Math.PI / 4;
-      const pitch = (Math.random() - 0.5) * Math.PI / 6;
-      bot.look(yaw, pitch, true);
-    }
-  }, 1000);
-  
-  await new Promise(resolve => setTimeout(resolve, duration));
-  clearInterval(lookInterval);
-}
-
-async function executeIdleLong() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.clearControlStates();
-  const duration = getRandomDelay(5000, 12000);
-  await new Promise(resolve => setTimeout(resolve, duration));
-}
-
-// New Idle Variations
-async function executeIdleWithMicroLook() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.clearControlStates();
-  const duration = getRandomDelay(3000, 8000);
-  const startTime = Date.now();
-  
-  while (Date.now() - startTime < duration && bot && isBotOnline) {
-    if (Math.random() < 0.1) {
-      const currentYaw = bot.entity.yaw;
-      const currentPitch = bot.entity.pitch;
-      const microYaw = currentYaw + (Math.random() - 0.5) * 0.1;
-      const microPitch = currentPitch + (Math.random() - 0.5) * 0.1;
-      bot.look(microYaw, microPitch, true);
-    }
-    
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-}
-
-async function executeCompleteStillness() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.clearControlStates();
-  const duration = getRandomDelay(20000, 40000); // 20-40 seconds
-  await new Promise(resolve => setTimeout(resolve, duration));
-}
-
-async function executeAfkSimulation() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.clearControlStates();
-  const duration = getRandomDelay(30000, 60000); // 30-60 seconds
-  
-  console.log('🎭 Simulating AFK behavior for', Math.floor(duration / 1000), 'seconds');
-  
-  await new Promise(resolve => setTimeout(resolve, duration));
-}
-
-// Interactive Actions
-async function executeHotbarSwitch() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  try {
-    const currentSlot = bot.quickBarSlot;
-    const numSwitches = 1 + Math.floor(Math.random() * 3);
-    
-    for (let i = 0; i < numSwitches; i++) {
-      if (!bot || !isBotOnline) break;
-      
-      let newSlot = Math.floor(Math.random() * 9);
-      if (newSlot === currentSlot) {
-        newSlot = (newSlot + 1) % 9;
-      }
-      
-      bot.setQuickBarSlot(newSlot);
-      await new Promise(resolve => setTimeout(resolve, getRandomDelay(100, 500)));
-    }
-  } catch (err) {
-    // Ignore hotbar errors
-  }
-}
-
-async function executeSwingArm() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const numSwings = 1 + Math.floor(Math.random() * 3);
-  
-  for (let i = 0; i < numSwings; i++) {
-    if (!bot || !isBotOnline) break;
-    
-    bot.swingArm('right');
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(100, 400)));
-  }
-  
-  movementCount++;
-}
-
-async function executeSneak() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.setControlState('sneak', true);
-  
-  const duration = getRandomDelay(500, 2500);
-  
-  if (Math.random() < 0.4) {
-    const directions = ['forward', 'back', 'left', 'right'];
-    const direction = directions[Math.floor(Math.random() * directions.length)];
-    bot.setControlState(direction, true);
-  }
-  
-  await new Promise(resolve => setTimeout(resolve, duration));
-  
-  if (bot) {
-    bot.clearControlStates();
-  }
-  
-  movementCount++;
-}
-
-async function executeJumpPlace() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.setControlState('jump', true);
-  bot.swingArm('right');
-  
-  await new Promise(resolve => setTimeout(resolve, 500));
-  
-  if (bot) {
-    bot.clearControlStates();
-  }
-  
-  movementCount++;
-}
-
-// New Interactive Variations
-async function executeRapidHotbarScroll() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  try {
-    for (let i = 0; i < 9 && bot && isBotOnline; i++) {
-      bot.setQuickBarSlot(i);
-      await new Promise(resolve => setTimeout(resolve, getRandomDelay(50, 150)));
-    }
-  } catch (err) {
-    // Ignore
-  }
-}
-
-async function executeSneakWalk() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.setControlState('sneak', true);
+  await smoothLook(yaw, (Math.random() - 0.5) * 0.3, humanDelay(300, 600));
+  if (!canActSpectator()) return;
   bot.setControlState('forward', true);
-  
-  const duration = getRandomDelay(2000, 5000);
-  await new Promise(resolve => setTimeout(resolve, duration));
-  
-  if (bot) bot.clearControlStates();
+  await sleep(humanDelay(2000, 5000));
+  bot.clearControlStates();
+  if (!canActSpectator()) return;
+  await doScanHorizon();
   movementCount++;
 }
 
-async function executeSneakLook() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.setControlState('sneak', true);
-  
-  const numLooks = 2 + Math.floor(Math.random() * 3);
-  for (let i = 0; i < numLooks && bot && isBotOnline; i++) {
-    const yaw = Math.random() * Math.PI * 2;
-    const pitch = (Math.random() - 0.5) * Math.PI / 3;
-    bot.look(yaw, pitch, true);
-    
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(500, 1200)));
-  }
-  
-  if (bot) bot.clearControlStates();
-}
-
-async function executeDoubleJump() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.setControlState('jump', true);
-  await new Promise(resolve => setTimeout(resolve, 300));
-  
-  if (bot) bot.setControlState('jump', false);
-  await new Promise(resolve => setTimeout(resolve, 200));
-  
-  if (bot) bot.setControlState('jump', true);
-  await new Promise(resolve => setTimeout(resolve, 300));
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-async function executeTripleJump() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  for (let i = 0; i < 3 && bot && isBotOnline; i++) {
-    bot.setControlState('jump', true);
-    await new Promise(resolve => setTimeout(resolve, 300));
-    bot.setControlState('jump', false);
-    await new Promise(resolve => setTimeout(resolve, 200));
-  }
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-async function executeCrouchSpam() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const iterations = 3 + Math.floor(Math.random() * 5);
-  
-  for (let i = 0; i < iterations && bot && isBotOnline; i++) {
-    bot.setControlState('sneak', true);
-    await new Promise(resolve => setTimeout(resolve, 150));
-    bot.setControlState('sneak', false);
-    await new Promise(resolve => setTimeout(resolve, 150));
-  }
-  
-  if (bot) bot.clearControlStates();
-}
-
-// Block Interaction Actions
-async function executeLookAtBlock() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  try {
-    const botPos = bot.entity.position;
-    const blockPos = botPos.offset(
-      Math.floor(Math.random() * 10) - 5,
-      Math.floor(Math.random() * 3) - 1,
-      Math.floor(Math.random() * 10) - 5
-    );
-    
-    const yaw = Math.atan2(-blockPos.x + botPos.x, blockPos.z - botPos.z);
-    const distance = botPos.distanceTo(blockPos);
-    const pitch = Math.atan2(blockPos.y - botPos.y, distance);
-    
-    bot.look(yaw, pitch, true);
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(1000, 3000)));
-  } catch (err) {
-    // Ignore
-  }
-}
-
-async function executeApproachBlock() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  try {
-    const botPos = bot.entity.position;
-    const targetPos = botPos.offset(
-      Math.floor(Math.random() * 5) - 2,
-      0,
-      Math.floor(Math.random() * 5) - 2
-    );
-    
-    const yaw = Math.atan2(-targetPos.x + botPos.x, targetPos.z - botPos.z);
-    bot.look(yaw, 0, true);
-    
-    bot.setControlState('forward', true);
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(1000, 2500)));
-    
-    if (bot) bot.clearControlStates();
-    movementCount++;
-  } catch (err) {
-    if (bot) bot.clearControlStates();
-  }
-}
-
-async function executeRightClickAir() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
+// 37. Activate item (right click in air)
+async function doActivateItem() {
+  if (!canActSpectator()) return;
   try {
     bot.activateItem();
-    await new Promise(resolve => setTimeout(resolve, 300));
-  } catch (err) {
-    // Ignore
-  }
+    await sleep(humanDelay(200, 500));
+  } catch (_) {}
 }
 
-async function executeLeftClickAir() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.swingArm('right');
-  await new Promise(resolve => setTimeout(resolve, 200));
-  movementCount++;
-}
-
-async function executeSwingAtBlock() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const numSwings = 2 + Math.floor(Math.random() * 4);
-  
-  for (let i = 0; i < numSwings && bot && isBotOnline; i++) {
-    bot.swingArm('right');
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(200, 500)));
-  }
-  
-  movementCount++;
-}
-
-// Human Mistake Actions
-async function executeWalkIntoWall() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  console.log('🤦 Making human mistake: walking into wall');
-  
-  bot.setControlState('forward', true);
-  const duration = getRandomDelay(1000, 2500);
-  await new Promise(resolve => setTimeout(resolve, duration));
-  
-  if (bot) bot.clearControlStates();
-  
-  // Pause as if confused
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(500, 1500)));
-  
-  movementCount++;
-  mistakeCounter++;
-}
-
-async function executeWrongDirection() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  console.log('🤦 Making human mistake: wrong direction');
-  
-  // Start moving in one direction
-  bot.setControlState('forward', true);
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(500, 1000)));
-  
-  // Suddenly realize and change direction
-  if (bot) {
-    bot.clearControlStates();
-    const yaw = bot.entity.yaw + Math.PI;
-    bot.look(yaw, 0, false);
-    bot.setControlState('forward', true);
-    
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(800, 1500)));
-  }
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-  mistakeCounter++;
-}
-
-async function executeSuddenStop() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  console.log('🤦 Making human mistake: sudden stop');
-  
-  bot.setControlState('forward', true);
-  bot.setControlState('sprint', true);
-  
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(1000, 2000)));
-  
-  // Sudden stop
-  if (bot) bot.clearControlStates();
-  
-  // Pause
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(1000, 3000)));
-  
-  movementCount++;
-  mistakeCounter++;
-}
-
-async function executeAccidentalJump() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  console.log('🤦 Making human mistake: accidental jump');
-  
-  // Random jump at inappropriate time
-  bot.setControlState('jump', true);
-  await new Promise(resolve => setTimeout(resolve, 300));
-  
-  if (bot) bot.clearControlStates();
-  
-  mistakeCounter++;
-}
-
-async function executeHesitation() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  console.log('🤦 Making human mistake: hesitation');
-  
-  // Start moving
-  bot.setControlState('forward', true);
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(300, 700)));
-  
-  // Stop
-  if (bot) bot.clearControlStates();
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(500, 1200)));
-  
-  // Continue
-  if (bot) bot.setControlState('forward', true);
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(500, 1000)));
-  
-  if (bot) bot.clearControlStates();
-  
-  movementCount++;
-  mistakeCounter++;
-}
-
-async function executeOvercorrection() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  console.log('🤦 Making human mistake: overcorrection');
-  
-  const currentYaw = bot.entity.yaw;
-  
-  // Turn too far
-  bot.look(currentYaw + Math.PI / 2, 0, true);
-  await new Promise(resolve => setTimeout(resolve, 300));
-  
-  // Correct back
-  if (bot) bot.look(currentYaw - Math.PI / 6, 0, true);
-  await new Promise(resolve => setTimeout(resolve, 300));
-  
-  // Final adjustment
-  if (bot) bot.look(currentYaw, 0, true);
-  
-  mistakeCounter++;
-}
-
-// Player-Aware Actions
-async function executeReactToPlayer() {
-  if (!bot || !bot.entity || !isBotOnline || nearbyPlayers.length === 0) return;
-  
-  console.log('👀 Reacting to nearby player');
-  
-  // Stop current movement
-  bot.clearControlStates();
-  
-  // Pause briefly
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(500, 1500)));
-  
-  // Look at player
-  const player = nearbyPlayers[0];
-  const botPos = bot.entity.position;
-  const playerPos = player.position;
-  
-  const yaw = Math.atan2(-playerPos.x + botPos.x, playerPos.z - botPos.z);
-  bot.look(yaw, 0, true);
-  
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(1000, 3000)));
-}
-
-async function executeLookAtPlayer() {
-  if (!bot || !bot.entity || !isBotOnline || nearbyPlayers.length === 0) return;
-  
-  const player = nearbyPlayers[0];
-  const botPos = bot.entity.position;
-  const playerPos = player.position;
-  
-  const yaw = Math.atan2(-playerPos.x + botPos.x, playerPos.z - botPos.z);
-  const distance = botPos.distanceTo(playerPos);
-  const pitch = Math.atan2(playerPos.y - botPos.y, distance);
-  
-  bot.look(yaw, pitch, true);
-  
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(2000, 5000)));
-}
-
-async function executeFollowPlayer() {
-  if (!bot || !bot.entity || !isBotOnline || nearbyPlayers.length === 0) return;
-  
-  console.log('🚶 Following nearby player briefly');
-  
-  const player = nearbyPlayers[0];
-  const duration = getRandomDelay(3000, 8000);
-  const startTime = Date.now();
-  
-  while (Date.now() - startTime < duration && bot && isBotOnline) {
-    const botPos = bot.entity.position;
-    const playerPos = player.position;
-    
-    const yaw = Math.atan2(-playerPos.x + botPos.x, playerPos.z - botPos.z);
-    bot.look(yaw, 0, true);
-    
-    bot.setControlState('forward', true);
-    
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-async function executeAvoidPlayer() {
-  if (!bot || !bot.entity || !isBotOnline || nearbyPlayers.length === 0) return;
-  
-  console.log('🏃 Avoiding nearby player');
-  
-  const player = nearbyPlayers[0];
-  const botPos = bot.entity.position;
-  const playerPos = player.position;
-  
-  // Look away from player
-  const yaw = Math.atan2(-playerPos.x + botPos.x, playerPos.z - botPos.z) + Math.PI;
-  bot.look(yaw, 0, true);
-  
-  bot.setControlState('forward', true);
-  
-  const duration = getRandomDelay(2000, 4000);
-  await new Promise(resolve => setTimeout(resolve, duration));
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-async function executeCuriousApproach() {
-  if (!bot || !bot.entity || !isBotOnline || nearbyPlayers.length === 0) return;
-  
-  console.log('🤔 Curiously approaching player');
-  
-  const player = nearbyPlayers[0];
-  
-  // Stop and look
-  bot.clearControlStates();
-  
-  const botPos = bot.entity.position;
-  const playerPos = player.position;
-  const yaw = Math.atan2(-playerPos.x + botPos.x, playerPos.z - botPos.z);
-  bot.look(yaw, 0, true);
-  
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(1000, 2000)));
-  
-  // Approach slowly with sneak
-  if (bot && isBotOnline) {
-    bot.setControlState('sneak', true);
-    bot.setControlState('forward', true);
-    
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(2000, 4000)));
-    
-    if (bot) bot.clearControlStates();
-  }
-  
-  movementCount++;
-}
-
-// Advanced Combo Actions
-async function executeJumpSprintCombo() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.setControlState('forward', true);
-  bot.setControlState('sprint', true);
-  
-  const duration = getRandomDelay(2000, 4000);
-  const startTime = Date.now();
-  
-  while (Date.now() - startTime < duration && bot && isBotOnline) {
-    if (Math.random() < 0.3) {
-      bot.setControlState('jump', true);
-      await new Promise(resolve => setTimeout(resolve, 300));
-      bot.setControlState('jump', false);
-    }
-    
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-async function executeSneakJumpCombo() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  bot.setControlState('sneak', true);
-  bot.setControlState('forward', true);
-  
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(1000, 2000)));
-  
-  if (bot && isBotOnline) {
-    bot.setControlState('jump', true);
-    await new Promise(resolve => setTimeout(resolve, 300));
-  }
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-async function executeStrafeLookCombo() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const duration = getRandomDelay(2000, 4000);
-  const startTime = Date.now();
-  
-  while (Date.now() - startTime < duration && bot && isBotOnline) {
-    bot.clearControlStates();
-    bot.setControlState(Math.random() < 0.5 ? 'left' : 'right', true);
-    
-    const yaw = Math.random() * Math.PI * 2;
-    bot.look(yaw, 0, true);
-    
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(500, 1200)));
-  }
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-async function executeWalkLookCombo() {
-  if (!bot || !bot.entity || !isBotOnline) return;
-  
-  const duration = getRandomDelay(3000, 6000);
-  const startTime = Date.now();
-  
-  bot.setControlState('forward', true);
-  
-  while (Date.now() - startTime < duration && bot && isBotOnline) {
-    if (Math.random() < 0.4) {
-      const yaw = Math.random() * Math.PI * 2;
-      const pitch = (Math.random() - 0.5) * Math.PI / 4;
-      bot.look(yaw, pitch, true);
-    }
-    
-    await new Promise(resolve => setTimeout(resolve, getRandomDelay(800, 1500)));
-  }
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-// Spectator-Specific Actions
-async function executeSpectatorFloat() {
-  if (!bot || !bot.entity || !isBotOnline || !isInSpectatorMode) return;
-  
-  console.log('👻 Spectator mode: floating');
-  
-  // In spectator mode, looking up/down affects vertical movement
-  bot.look(bot.entity.yaw, -Math.PI / 4, true);
-  bot.setControlState('forward', true);
-  
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(2000, 4000)));
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-async function executeSpectatorPhase() {
-  if (!bot || !bot.entity || !isBotOnline || !isInSpectatorMode) return;
-  
-  console.log('👻 Spectator mode: phasing through blocks');
-  
-  // Look at a random direction and move through
-  const yaw = Math.random() * Math.PI * 2;
-  bot.look(yaw, 0, true);
-  
-  bot.setControlState('forward', true);
-  
-  await new Promise(resolve => setTimeout(resolve, getRandomDelay(1500, 3000)));
-  
-  if (bot) bot.clearControlStates();
-  movementCount++;
-}
-
-// Main action executor
-async function executeAction(actionName) {
-  if (!bot || !isBotOnline || actionInProgress) return;
-  
-  actionInProgress = true;
-  currentAction = actionName;
-  
+// 38. Deactivate item
+async function doDeactivateItem() {
+  if (!canActSpectator()) return;
   try {
-    switch (actionName) {
-      // Basic movements
-      case 'WALK_SHORT': await executeWalkShort(); break;
-      case 'WALK_LONG': await executeWalkLong(); break;
-      case 'WANDER': await executeWander(); break;
-      case 'SPRINT_TRAVEL': await executeSprintTravel(); break;
-      case 'JUMP_MOVE': await executeJumpMove(); break;
-      
-      // New movement variations
-      case 'DIAGONAL_WALK': await executeDiagonalWalk(); break;
-      case 'ZIGZAG_MOVEMENT': await executeZigzagMovement(); break;
-      case 'CIRCLE_WALK': await executeCircleWalk(); break;
-      case 'BACKWARDS_WALK': await executeBackwardsWalk(); break;
-      case 'STRAFE_LEFT_RIGHT': await executeStrafeLeftRight(); break;
-      
-      // Looking actions
-      case 'LOOK_AROUND': await executeLookAround(); break;
-      case 'LOOK_SLOWLY': await executeLookSlowly(); break;
-      case 'LOOK_QUICK': await executeLookQuick(); break;
-      case 'LOOK_UP_DOWN': await executeLookUpDown(); break;
-      case 'LOOK_AT_GROUND': await executeLookAtGround(); break;
-      case 'LOOK_AT_SKY': await executeLookAtSky(); break;
-      case 'SCAN_HORIZON': await executeScanHorizon(); break;
-      case 'QUICK_HEAD_TURN': await executeQuickHeadTurn(); break;
-      case 'LOOK_BEHIND': await executeLookBehind(); break;
-      
-      // Idle actions
-      case 'IDLE_SHORT': await executeIdleShort(); break;
-      case 'IDLE_MEDIUM': await executeIdleMedium(); break;
-      case 'IDLE_LONG': await executeIdleLong(); break;
-      case 'IDLE_WITH_MICRO_LOOK': await executeIdleWithMicroLook(); break;
-      case 'COMPLETE_STILLNESS': await executeCompleteStillness(); break;
-      case 'AFK_SIMULATION': await executeAfkSimulation(); break;
-      
-      // Interactive actions
-      case 'HOTBAR_SWITCH': await executeHotbarSwitch(); break;
-      case 'SWING_ARM': await executeSwingArm(); break;
-      case 'SNEAK': await executeSneak(); break;
-      case 'JUMP_PLACE': await executeJumpPlace(); break;
-      case 'RAPID_HOTBAR_SCROLL': await executeRapidHotbarScroll(); break;
-      case 'SNEAK_WALK': await executeSneakWalk(); break;
-      case 'SNEAK_LOOK': await executeSneakLook(); break;
-      case 'DOUBLE_JUMP': await executeDoubleJump(); break;
-      case 'TRIPLE_JUMP': await executeTripleJump(); break;
-      case 'CROUCH_SPAM': await executeCrouchSpam(); break;
-      
-      // Block interactions
-      case 'LOOK_AT_BLOCK': await executeLookAtBlock(); break;
-      case 'APPROACH_BLOCK': await executeApproachBlock(); break;
-      case 'RIGHT_CLICK_AIR': await executeRightClickAir(); break;
-      case 'LEFT_CLICK_AIR': await executeLeftClickAir(); break;
-      case 'SWING_AT_BLOCK': await executeSwingAtBlock(); break;
-      
-      // Human mistakes
-      case 'WALK_INTO_WALL': await executeWalkIntoWall(); break;
-      case 'WRONG_DIRECTION': await executeWrongDirection(); break;
-      case 'SUDDEN_STOP': await executeSuddenStop(); break;
-      case 'ACCIDENTAL_JUMP': await executeAccidentalJump(); break;
-      case 'HESITATION': await executeHesitation(); break;
-      case 'OVERCORRECTION': await executeOvercorrection(); break;
-      
-      // Player-aware
-      case 'REACT_TO_PLAYER': await executeReactToPlayer(); break;
-      case 'LOOK_AT_PLAYER': await executeLookAtPlayer(); break;
-      case 'FOLLOW_PLAYER': await executeFollowPlayer(); break;
-      case 'AVOID_PLAYER': await executeAvoidPlayer(); break;
-      case 'CURIOUS_APPROACH': await executeCuriousApproach(); break;
-      
-      // Combos
-      case 'JUMP_SPRINT_COMBO': await executeJumpSprintCombo(); break;
-      case 'SNEAK_JUMP_COMBO': await executeSneakJumpCombo(); break;
-      case 'STRAFE_LOOK_COMBO': await executeStrafeLookCombo(); break;
-      case 'WALK_LOOK_COMBO': await executeWalkLookCombo(); break;
-      
-      // Spectator-specific
-      case 'SPECTATOR_FLOAT': await executeSpectatorFloat(); break;
-      case 'SPECTATOR_PHASE': await executeSpectatorPhase(); break;
-      
-      default:
-        console.log(`⚠️  Unknown action: ${actionName}`);
+    bot.deactivateItem();
+    await sleep(humanDelay(100, 300));
+  } catch (_) {}
+}
+
+// 39. Up + down oscillation (hovering simulation)
+async function doHover() {
+  if (!canActSpectator()) return;
+  const cycles = 2 + Math.floor(Math.random() * 3);
+  for (let i = 0; i < cycles; i++) {
+    if (!canActSpectator()) break;
+    bot.setControlState('jump', true);
+    await sleep(humanDelay(300, 700));
+    bot.clearControlStates();
+    await sleep(humanDelay(200, 400));
+    bot.setControlState('sneak', true);
+    await sleep(humanDelay(300, 700));
+    bot.clearControlStates();
+    await sleep(humanDelay(200, 400));
+  }
+  movementCount++;
+}
+
+// 40. Full stop (clear everything, micro drift)
+async function doFullStop() {
+  if (!canActSpectator()) return;
+  bot.clearControlStates();
+  await microDrift(humanDelay(500, 1500));
+}
+
+// 41. Look toward spawn (0,0)
+async function doLookTowardSpawn() {
+  if (!canActSpectator()) return;
+  const pos = bot.entity.position;
+  const yaw = Math.atan2(-pos.x, pos.z);
+  await smoothLook(yaw, 0, humanDelay(600, 1500));
+  await sleep(humanDelay(1000, 3000));
+}
+
+// 42. Stutter fly (start/stop multiple times)
+async function doStutterFly() {
+  if (!canActSpectator()) return;
+  const stops = 3 + Math.floor(Math.random() * 3);
+  const yaw   = Math.random() * Math.PI * 2;
+  await smoothLook(yaw, 0, humanDelay(200, 400));
+  for (let i = 0; i < stops; i++) {
+    if (!canActSpectator()) break;
+    bot.setControlState('forward', true);
+    await sleep(humanDelay(300, 800));
+    bot.clearControlStates();
+    await sleep(humanDelay(200, 600));
+  }
+  movementCount++;
+}
+
+// ============================================================================
+// 🎯 ACTION TABLE
+// ============================================================================
+const ACTIONS = [
+  // --- Looking (no guard issue if spectator not confirmed yet, but we still check) ---
+  { name: 'LOOK_AROUND',         fn: doLookAround,          weight: 14, phase: 'all'      },
+  { name: 'SLOW_PAN',            fn: doSlowPan,             weight: 10, phase: 'all'      },
+  { name: 'QUICK_LOOK',          fn: doQuickLook,           weight:  6, phase: 'all'      },
+  { name: 'LOOK_AT_SKY',         fn: doLookAtSky,           weight:  5, phase: 'all'      },
+  { name: 'LOOK_AT_GROUND',      fn: doLookAtGround,        weight:  4, phase: 'all'      },
+  { name: 'SCAN_HORIZON',        fn: doScanHorizon,         weight:  6, phase: 'all'      },
+  { name: 'LOOK_BEHIND',         fn: doLookBehind,          weight:  4, phase: 'all'      },
+  { name: 'LOOK_AT_COORD',       fn: doLookAtCoord,         weight:  5, phase: 'all'      },
+  { name: 'LOOK_TOWARD_SPAWN',   fn: doLookTowardSpawn,     weight:  2, phase: 'all'      },
+
+  // --- Flight ---
+  { name: 'FLY_FORWARD',         fn: doFlyForward,          weight: 14, phase: 'active'   },
+  { name: 'FLY_BACKWARD',        fn: doFlyBackward,         weight:  4, phase: 'all'      },
+  { name: 'SPRINT_FLY',          fn: doSprintFly,           weight:  8, phase: 'active'   },
+  { name: 'FLY_UP',              fn: doFlyUp,               weight:  6, phase: 'all'      },
+  { name: 'FLY_DOWN',            fn: doFlyDown,             weight:  5, phase: 'all'      },
+  { name: 'FLOAT_UP',            fn: doFloatUp,             weight:  4, phase: 'all'      },
+  { name: 'FLOAT_DOWN',          fn: doFloatDown,           weight:  4, phase: 'all'      },
+  { name: 'STRAFE',              fn: doStrafe,              weight:  5, phase: 'all'      },
+  { name: 'ZIGZAG_FLY',          fn: doZigzagFly,           weight:  5, phase: 'active'   },
+  { name: 'DIAGONAL_FLY',        fn: doDiagonalFly,         weight:  4, phase: 'all'      },
+  { name: 'CIRCLE_FLY',          fn: doCircleFly,           weight:  3, phase: 'moderate' },
+  { name: 'ORBIT_FLY',           fn: doOrbitFly,            weight:  2, phase: 'moderate' },
+  { name: 'FIGURE_EIGHT',        fn: doFigureEightFly,      weight:  2, phase: 'moderate' },
+  { name: 'PHASE_THROUGH',       fn: doPhaseThrough,        weight:  3, phase: 'active'   },
+  { name: 'EXPLORE',             fn: doExplore,             weight:  4, phase: 'active'   },
+  { name: 'STUTTER_FLY',         fn: doStutterFly,          weight:  3, phase: 'all'      },
+  { name: 'HOVER',               fn: doHover,               weight:  3, phase: 'all'      },
+
+  // --- Idle ---
+  { name: 'IDLE_SHORT',          fn: doIdleShort,           weight: 10, phase: 'all'      },
+  { name: 'IDLE_MEDIUM',         fn: doIdleMedium,          weight:  7, phase: 'all'      },
+  { name: 'IDLE_LONG',           fn: doIdleLong,            weight:  4, phase: 'idle'     },
+  { name: 'FULL_STOP',           fn: doFullStop,            weight:  5, phase: 'all'      },
+
+  // --- Interactive ---
+  { name: 'SWING_ARM',           fn: doSwingArm,            weight:  5, phase: 'all'      },
+  { name: 'HOTBAR_SWITCH',       fn: doHotbarSwitch,        weight:  4, phase: 'all'      },
+  { name: 'HOTBAR_SCROLL',       fn: doHotbarScroll,        weight:  2, phase: 'all'      },
+  { name: 'ACTIVATE_ITEM',       fn: doActivateItem,        weight:  3, phase: 'all'      },
+  { name: 'DEACTIVATE_ITEM',     fn: doDeactivateItem,      weight:  2, phase: 'all'      },
+
+  // --- Player-aware (only run when nearbyPlayers > 0) ---
+  { name: 'LOOK_AT_PLAYER',      fn: doLookAtPlayer,        weight:  9, phase: 'all',     needsPlayer: true },
+  { name: 'FLY_TOWARD_PLAYER',   fn: doFlyTowardPlayer,     weight:  4, phase: 'active',  needsPlayer: true },
+  { name: 'FLY_AWAY_PLAYER',     fn: doFlyAwayFromPlayer,   weight:  3, phase: 'all',     needsPlayer: true },
+
+  // --- Human mistakes ---
+  { name: 'WRONG_DIRECTION',     fn: doWrongDirection,      weight:  2, phase: 'all'      },
+  { name: 'SUDDEN_STOP',         fn: doSuddenStop,          weight:  2, phase: 'all'      },
+  { name: 'HESITATION',          fn: doHesitation,          weight:  3, phase: 'all'      },
+  { name: 'OVERCORRECT_LOOK',    fn: doOvercorrectLook,     weight:  2, phase: 'all'      },
+];
+
+function buildWeightedPool() {
+  const pool = [];
+  for (const action of ACTIONS) {
+    // Phase filter
+    if (action.phase !== 'all' && action.phase !== behaviorPhase) {
+      // Allow actions of other phases with reduced weight
+      const reduced = Math.max(1, Math.floor(action.weight * 0.25));
+      for (let i = 0; i < reduced; i++) pool.push(action);
+      continue;
     }
+    // Player-required filter
+    if (action.needsPlayer && nearbyPlayers.length === 0) continue;
+
+    // Boost player-aware actions if players are nearby
+    let w = action.weight;
+    if (action.needsPlayer && nearbyPlayers.length > 0) w *= 3;
+
+    // Boost idle in idle phase
+    if (behaviorPhase === 'idle' && action.name.includes('IDLE')) w *= 2;
+
+    // 5% chance to inject mistake
+    if (action.name.includes('DIRECTION') || action.name.includes('STOP') ||
+        action.name.includes('HESITATION') || action.name.includes('OVERCORRECT')) {
+      if (Math.random() < 0.05) w *= 4;
+    }
+
+    for (let i = 0; i < w; i++) pool.push(action);
+  }
+  return pool;
+}
+
+function pickAction() {
+  const pool = buildWeightedPool();
+  if (pool.length === 0) return ACTIONS[0];
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// ============================================================================
+// ⚙️ ACTION EXECUTOR + SCHEDULER
+// ============================================================================
+async function executeAction(action) {
+  // Double-check guard before every action
+  if (!canActSpectator() || actionInProgress) return;
+
+  actionInProgress = true;
+  currentAction    = action.name;
+
+  try {
+    await action.fn();
   } catch (err) {
-    console.error(`❌ Error executing action ${actionName}:`, err.message);
+    console.error(`❌ Action ${action.name} error:`, err.message);
+    if (bot && botReady) {
+      try { bot.clearControlStates(); } catch (_) {}
+    }
   } finally {
     actionInProgress = false;
-    currentAction = null;
+    currentAction    = null;
   }
 }
 
 function scheduleNextAction() {
-  if (!bot || !isBotOnline || isShuttingDown) return;
-  
-  // Update context
-  checkNearbyPlayers();
+  if (!canActSpectator() || isShuttingDown) return;
+
+  refreshNearbyPlayers();
   updateBehaviorPhase();
-  updateSpectatorMode();
-  
-  // Dynamic delay based on behavior phase
-  let minDelay, maxDelay;
-  
+
+  let minMs, maxMs;
   switch (behaviorPhase) {
-    case 'active':
-      minDelay = 500;
-      maxDelay = 4000;
-      break;
-    case 'moderate':
-      minDelay = 2000;
-      maxDelay = 8000;
-      break;
-    case 'idle':
-      minDelay = 5000;
-      maxDelay = 15000;
-      break;
-    default:
-      minDelay = 1000;
-      maxDelay = 6000;
+    case 'active':   minMs =  500; maxMs =  4000; break;
+    case 'moderate': minMs = 2000; maxMs =  9000; break;
+    case 'idle':     minMs = 5000; maxMs = 18000; break;
+    default:         minMs = 1000; maxMs =  6000;
   }
-  
-  // If players nearby, be more active
+
+  // More responsive when players are nearby
   if (nearbyPlayers.length > 0) {
-    minDelay = Math.max(500, minDelay * 0.7);
-    maxDelay = Math.max(2000, maxDelay * 0.7);
+    minMs = Math.max(300, minMs * 0.6);
+    maxMs = Math.max(2000, maxMs * 0.6);
   }
-  
-  const delay = getRandomDelay(minDelay, maxDelay);
-  
-  actionSchedulerTimeout = setTimeout(async () => {
-    if (!bot || !isBotOnline) return;
-    
-    const action = selectRandomAction();
-    
+
+  const delay = humanDelay(minMs, maxMs);
+
+  actionSchedulerHandle = setTimeout(async () => {
+    if (!canActSpectator()) return;
+
+    const action = pickAction();
+
+    // Log occasionally (5%)
     if (Math.random() < 0.05) {
-      console.log(`🎮 [${behaviorPhase}] ${action} | Players nearby: ${nearbyPlayers.length} | Mistakes: ${mistakeCounter}`);
+      console.log(`🎮 [${behaviorPhase}] ${action.name} | nearby: ${nearbyPlayers.length} | moves: ${movementCount} | mistakes: ${mistakeCounter}`);
     }
-    
+
     await executeAction(action);
-    
-    scheduleNextAction();
+
+    // Schedule next only if still valid
+    if (canActSpectator()) {
+      scheduleNextAction();
+    }
   }, delay);
 }
 
-function setupIntervals() {
-  console.log('🎮 Starting enhanced action-based scheduler with 40+ movements...');
-  scheduleNextAction();
-  
-  activityCheckTimeout = setInterval(() => {
-    checkBotActivity();
-    checkPlayerCount();
-    checkNearbyPlayers();
-  }, ACTIVITY_CHECK_INTERVAL);
-  
-  setTimeout(sendPlayerList, 5000);
-  setTimeout(sendBotStats, 10000);
-  setTimeout(checkPlayerCount, 3000);
-}
-
+// ============================================================================
+// 🏃 ACTIVITY CHECK
+// ============================================================================
 function checkBotActivity() {
   if (!botStartTime || !isBotOnline || !ANTI_AFK) return;
-
   const uptime = Date.now() - botStartTime;
   if (uptime >= ONE_HOUR) {
-    sendDiscordEmbed('Bot Activity', 'Bot active for over 1 hour. Rejoining to prevent AFK detection.', WARNING_EMBED_COLOR);
-    forceRejoinBot();
-    return;
+    console.log('⏰ 1-hour uptime reached — rejoining to avoid AFK detection');
+    sendDiscordEmbed('AFK Prevention', 'Bot active 1+ hour — rejoining server', WARNING_COLOR);
+    forceRejoin();
   }
 }
 
+function setupActivityCheck() {
+  if (activityCheckHandle) clearInterval(activityCheckHandle);
+  activityCheckHandle = setInterval(() => {
+    checkBotActivity();
+    checkPlayerCount();
+    refreshNearbyPlayers();
+  }, ACTIVITY_CHECK_MS);
+}
+
+// ============================================================================
+// 🔁 RECONNECT LOGIC (3s → 5s → 10s max)
+// ============================================================================
+function getReconnectDelay() {
+  const idx = Math.min(consecutiveFailures, RECONNECT_DELAYS.length - 1);
+  return RECONNECT_DELAYS[idx];
+}
+
+function scheduleReconnect() {
+  if (isShuttingDown) {
+    console.log('🛑 Shutting down — skipping reconnect');
+    return;
+  }
+  clearAllHandles();
+  const delay = getReconnectDelay();
+  console.log(`⏳ Reconnecting in ${delay / 1000}s (failure #${consecutiveFailures + 1})...`);
+  reconnectHandle = setTimeout(() => startBot(), delay);
+}
+
+function forceRejoin() {
+  if (isShuttingDown) return;
+  clearAllHandles();
+  console.log(`⏳ Force-rejoining in 5s...`);
+  reconnectHandle = setTimeout(() => startBot(), 5000);
+}
+
+// ============================================================================
+// 🗃️ PLAYER FACE MANAGEMENT
+// ============================================================================
 async function getOrCreatePlayerFace(username, uuid) {
-  let playerFace = await PlayerFace.findOne({ username: username });
-  let skinUrl;
+  if (!dbConnected || !PlayerFace) {
+    // Fallback: return crafatar URL if not a dot-username
+    if (username && !username.startsWith('.') && uuid) {
+      return `https://crafatar.com/avatars/${uuid}?size=32&overlay`;
+    }
+    return `./${FACES[Math.floor(Math.random() * FACES.length)]}`;
+  }
 
-  if (!playerFace) {
+  try {
+    let record = await PlayerFace.findOne({ username });
+    if (record) {
+      return record.isCustom ? record.face : `./${record.face}`;
+    }
+
+    let skinUrl;
     if (username.startsWith('.')) {
-      const assignedFaces = await PlayerFace.find({ username: { $regex: '^\\.' } }, 'face');
-      const availableFaces = FACES.filter(face => !assignedFaces.some(pf => pf.face === face));
-
-      let selectedFace;
-      if (availableFaces.length > 0 && nextDotFaceIndex < FACES.length) {
-        selectedFace = FACES[nextDotFaceIndex];
-        nextDotFaceIndex = (nextDotFaceIndex + 1) % FACES.length;
-      } else {
-        selectedFace = FACES[Math.floor(Math.random() * FACES.length)];
-      }
-      playerFace = new PlayerFace({ username: username, face: selectedFace, isCustom: false });
-      skinUrl = `./${selectedFace}`;
+      const used = await PlayerFace.find({ username: /^\./ }, 'face');
+      const available = FACES.filter(f => !used.some(u => u.face === f));
+      const face = available.length > 0 ? FACES[nextDotFaceIndex++ % FACES.length] : FACES[Math.floor(Math.random() * FACES.length)];
+      record  = new PlayerFace({ username, face, isCustom: false });
+      skinUrl = `./${face}`;
     } else {
       try {
-        const faceUrl = uuid ? `https://crafatar.com/avatars/${uuid}?size=32&overlay` : `https://crafatar.com/avatars/${username}?size=32&overlay`;
-        const crafatarResponse = await axios.get(faceUrl, { responseType: 'arraybuffer' });
-        
-        if (crafatarResponse.status === 200) {
+        const faceUrl = uuid
+          ? `https://crafatar.com/avatars/${uuid}?size=32&overlay`
+          : `https://crafatar.com/avatars/${username}?size=32&overlay`;
+        const res = await axios.get(faceUrl, { responseType: 'arraybuffer', timeout: 5000 });
+        if (res.status === 200) {
           skinUrl = faceUrl;
-          playerFace = new PlayerFace({ username: username, face: skinUrl, isCustom: true });
-        } else {
-          throw new Error("Face not found");
-        }
-      } catch (crafatarError) {
-        const selectedFace = FACES[Math.floor(Math.random() * FACES.length)];
-        skinUrl = `./${selectedFace}`;
-        playerFace = new PlayerFace({ username: username, face: selectedFace, isCustom: false });
+          record  = new PlayerFace({ username, face: skinUrl, isCustom: true });
+        } else throw new Error('not found');
+      } catch (_) {
+        const face = FACES[Math.floor(Math.random() * FACES.length)];
+        skinUrl = `./${face}`;
+        record  = new PlayerFace({ username, face, isCustom: false });
       }
     }
-    await playerFace.save();
-  } else {
-    skinUrl = playerFace.isCustom ? playerFace.face : `./${playerFace.face}`;
+
+    await record.save();
+    return skinUrl;
+  } catch (err) {
+    console.error('❌ getOrCreatePlayerFace error:', err.message);
+    return `./${FACES[0]}`;
   }
-  return skinUrl;
 }
 
+// ============================================================================
+// 📊 STATUS PAYLOAD
+// ============================================================================
+function getCpuUsage() {
+  const cpus = os.cpus();
+  let totalIdle = 0, totalTick = 0;
+  for (const cpu of cpus) {
+    for (const t in cpu.times) totalTick += cpu.times[t];
+    totalIdle += cpu.times.idle;
+  }
+  const idleDiff  = totalIdle - lastCpuSnapshot.idle;
+  const totalDiff = totalTick - lastCpuSnapshot.total;
+  lastCpuSnapshot = { idle: totalIdle, total: totalTick };
+  if (totalDiff === 0) return 0;
+  return 100 - (100 * idleDiff / totalDiff);
+}
+
+async function getBotStatusPayload() {
+  const active = canAct();
+
+  let onlineCount   = 0;
+  let playerDetails = [];
+
+  if (active) {
+    const others = getOnlinePlayersExcludingBot();
+    onlineCount   = others.length;
+    playerDetails = await Promise.all(others.map(async p => {
+      const skinUrl = await getOrCreatePlayerFace(p.username, p.uuid);
+      return { username: p.username, uuid: p.uuid, skinUrl };
+    }));
+  }
+
+  let diskInfo = { free: 0, total: 0 };
+  try {
+    diskInfo = await diskusage.check(os.platform() === 'win32' ? 'C:' : '/');
+  } catch (_) {}
+
+  return {
+    message:           active ? 'Bot is running!' : 'Bot is offline',
+    onlinePlayersCount: active ? onlineCount : 0,
+    playerDetails:     active ? playerDetails : [],
+    gameMode:          active && bot.game ? bot.game.gameMode : 'N/A',
+    isSpectator:       isInSpectatorMode,
+    position:          active && bot.entity ? {
+      x: Math.floor(bot.entity.position.x),
+      y: Math.floor(bot.entity.position.y),
+      z: Math.floor(bot.entity.position.z),
+    } : 'N/A',
+    uptime:            active && botStartTime ? Math.floor((Date.now() - botStartTime) / 1000) : 0,
+    movements:         active ? movementCount : 0,
+    currentAction:     active ? currentAction : null,
+    behaviorPhase:     behaviorPhase,
+    memoryUsage:       `${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB`,
+    lastOnline:        lastOnlineTime || null,
+    serverHost:        currentServerHost,
+    serverPort:        currentServerPort,
+    botName:           BOT_USERNAME,
+    botHealth:         active && bot.health !== undefined ? `${Math.round(bot.health)}/20` : 'N/A',
+    botFood:           active && bot.food   !== undefined ? `${Math.round(bot.food)}/20`   : 'N/A',
+    botLatency:        active && bot.player && bot.player.ping !== undefined ? `${bot.player.ping}ms` : 'N/A',
+    serverLoad:        os.loadavg()[0].toFixed(2),
+    cpuUsage:          getCpuUsage().toFixed(2),
+    diskFree:          diskInfo.total > 0 ? `${(diskInfo.free  / 1073741824).toFixed(2)} GB` : 'N/A',
+    diskTotal:         diskInfo.total > 0 ? `${(diskInfo.total / 1073741824).toFixed(2)} GB` : 'N/A',
+    minecraftDay:      active && bot.time ? bot.time.day       : 'N/A',
+    minecraftTime:     active && bot.time ? bot.time.timeOfDay : 'N/A',
+    serverDifficulty:  active && bot.game  ? bot.game.difficulty : 'N/A',
+    timeFrozen:        isTimeFrozen,
+    version:           BOT_VERSION,
+    nearbyPlayers:     nearbyPlayers.length,
+    consecutiveFailures,
+    dbConnected,
+  };
+}
+
+// ============================================================================
+// 🤖 BOT STARTUP
+// ============================================================================
 function startBot() {
   if (isShuttingDown) {
-    console.log('⚠️  Bot is shutting down, not starting new connection');
+    console.log('🛑 Shutting down — not starting bot');
     return;
   }
 
-  clearAllIntervals();
+  clearAllHandles();
+
+  // Destroy old bot if exists
   if (bot) {
-    bot.removeAllListeners();
+    try {
+      bot.removeAllListeners();
+      bot.quit('Restarting');
+    } catch (_) {}
     bot = null;
   }
 
   resetBotState();
+  currentServerHost = BOT_HOST;
+  currentServerPort = BOT_PORT;
 
-  console.log(`🚀 Starting bot with version ${BOT_VERSION}...`);
-  bot = mineflayer.createBot(botOptions);
+  console.log(`\n🚀 Connecting to ${BOT_HOST}:${BOT_PORT} as ${BOT_USERNAME} (${BOT_VERSION})...`);
 
-  bot.once('spawn', () => {
-    sendDiscordEmbed('Bot Connected', `${botOptions.username} has joined the server (v${BOT_VERSION})`, SUCCESS_EMBED_COLOR);
-    isBotOnline = true;
-    botStartTime = Date.now();
-    lastOnlineTime = Date.now();
+  const botOptions = {
+    host:           BOT_HOST,
+    port:           BOT_PORT,
+    username:       BOT_USERNAME,
+    version:        BOT_VERSION,
+    keepAlive:      true,
+    checkTimeoutInterval: 60000,
+    chatLengthLimit: 256,
+    auth:           'offline',
+  };
+
+  try {
+    bot = mineflayer.createBot(botOptions);
+  } catch (err) {
+    console.error('❌ Failed to create bot:', err.message);
+    consecutiveFailures++;
+    scheduleReconnect();
+    return;
+  }
+
+  // ---- SPAWN TIMEOUT — if bot never fires 'spawn' within SPAWN_TIMEOUT_MS ----
+  spawnTimeoutHandle = setTimeout(() => {
+    if (!isBotOnline) {
+      console.log(`⏰ Spawn timeout after ${SPAWN_TIMEOUT_MS / 1000}s — retrying...`);
+      consecutiveFailures++;
+      try { bot.quit('Spawn timeout'); } catch (_) {}
+      scheduleReconnect();
+    }
+  }, SPAWN_TIMEOUT_MS);
+
+  // ---- SPAWN ----
+  bot.once('spawn', async () => {
+    clearTimeout(spawnTimeoutHandle);
+    spawnTimeoutHandle = null;
+
+    console.log(`✅ Spawned on ${BOT_HOST}:${BOT_PORT}`);
+
+    isBotOnline        = true;
+    botStartTime       = Date.now();
+    lastOnlineTime     = Date.now();
     consecutiveFailures = 0;
-    console.log(`✅ Bot spawned successfully on ${BOT_HOST}:${BOT_PORT}`);
 
+    // Keep TCP alive
     if (bot._client && bot._client.socket) {
       bot._client.socket.setKeepAlive(true, 30000);
+      bot._client.socket.setTimeout(0); // no idle timeout
     }
-    
+
+    // Wait for game mode packet (give server time to set it)
+    await sleep(1500);
+
+    // Detect game mode from bot.game
+    updateSpectatorMode();
+
+    // Also listen for game mode changes via player_info packet
     if (bot._client) {
       bot._client.on('player_info', (packet) => {
-        packet.data.forEach((player) => {
-          if (player.uuid === bot.uuid) {
-            const gamemodeMap = { 0: 'Survival', 1: 'Creative', 2: 'Adventure', 3: 'Spectator' };
-            const currentGamemode = gamemodeMap[player.gamemode] || 'Unknown';
-            bot.game = bot.game || {};
-            bot.game.gameMode = currentGamemode;
-            updateSpectatorMode();
+        if (!packet || !packet.data) return;
+        packet.data.forEach(entry => {
+          if (entry.uuid === bot.uuid) {
+            const gmMap = { 0: 'survival', 1: 'creative', 2: 'adventure', 3: 'spectator' };
+            const gm    = gmMap[entry.gamemode];
+            if (gm) {
+              bot.game = bot.game || {};
+              bot.game.gameMode = gm;
+              const wasSpectator = isInSpectatorMode;
+              updateSpectatorMode();
+              if (!wasSpectator && isInSpectatorMode) {
+                console.log('🎮 Game mode switched to SPECTATOR — starting movement engine');
+                if (!actionSchedulerHandle) scheduleNextAction();
+              } else if (wasSpectator && !isInSpectatorMode) {
+                console.log('⚠️  No longer in spectator — movement engine paused');
+                if (bot) bot.clearControlStates();
+                if (actionSchedulerHandle) {
+                  clearTimeout(actionSchedulerHandle);
+                  actionSchedulerHandle = null;
+                }
+              }
+            }
           }
         });
       });
+
+      // Also listen for game_state_change (for game mode updates)
+      bot._client.on('game_state_change', (packet) => {
+        if (packet.reason === 3) { // change game mode
+          const gmMap = { 0: 'survival', 1: 'creative', 2: 'adventure', 3: 'spectator' };
+          const gm    = gmMap[packet.gameMode];
+          if (gm) {
+            bot.game = bot.game || {};
+            bot.game.gameMode = gm;
+            updateSpectatorMode();
+          }
+        }
+      });
     }
+
+    // Mark as truly ready
+    botReady = true;
+
+    if (!isInSpectatorMode) {
+      console.log('⚠️  Bot spawned but NOT in spectator mode — waiting for mode to be set');
+      console.log('   (Bot will only perform movements once confirmed in spectator mode)');
+    }
+
+    sendDiscordEmbed(
+      'Bot Connected',
+      `**${BOT_USERNAME}** joined ${BOT_HOST} (v${BOT_VERSION})\nMode: ${bot.game?.gameMode || 'unknown'}`,
+      SUCCESS_COLOR,
+    );
+
+    setupActivityCheck();
+
+    // Start movement engine only if already in spectator
+    if (isInSpectatorMode) {
+      console.log('🎮 Already in spectator mode — starting movement engine');
+      await sleep(500);
+      scheduleNextAction();
+    }
+
+    // Send stats after 10s
+    setTimeout(() => {
+      if (canAct()) sendBotStats();
+    }, 10000);
 
     setTimeout(() => {
-      setupIntervals();
-    }, 1000);
+      if (canAct()) checkPlayerCount();
+    }, 3000);
   });
 
+  // ---- ERROR ----
   bot.on('error', (err) => {
-    console.error('❌ Bot Error:', err.message);
-    sendDiscordEmbed('Bot Error', `Error: ${err.message}`, ERROR_EMBED_COLOR);
+    // Stop ghost actions immediately
+    botReady   = false;
+    isBotOnline = false;
 
-    if (err.message.includes("timed out") ||
-        err.message.includes("ECONNRESET") ||
-        err.message.includes("ECONNREFUSED") ||
-        err.name === 'PartialReadError' ||
-        err.message.includes("Unexpected buffer end")) {
-      
-      resetBotState();
-      clearAllIntervals();
+    const msg = err.message || String(err);
+    console.error('❌ Bot error:', msg);
+
+    const isNetworkError =
+      msg.includes('ECONNRESET')   ||
+      msg.includes('ECONNREFUSED') ||
+      msg.includes('ETIMEDOUT')    ||
+      msg.includes('timed out')    ||
+      msg.includes('ENOTFOUND')    ||
+      msg.includes('PartialReadError') ||
+      msg.includes('Unexpected buffer end');
+
+    if (isNetworkError) {
+      sendDiscordEmbed('Network Error', `${msg}`, WARNING_COLOR);
+      clearAllHandles();
       consecutiveFailures++;
-      
-      if (AUTO_REJOIN) {
-        reconnectBot();
-      }
-    }
-  });
-
-  bot.on('end', async (reason) => {
-    console.log('🔌 Bot disconnected:', reason);
-    
-    await ensureTimeUnfrozen();
-    resetBotState();
-    clearAllIntervals();
-    consecutiveFailures++;
-    
-    if (AUTO_REJOIN && !isShuttingDown) {
-      reconnectBot();
-    }
-  });
-
-  bot.on('kicked', async (reason) => {
-    console.log('⛔ Bot was kicked:', reason);
-    const reasonStr = typeof reason === 'string' ? reason : JSON.stringify(reason);
-    await sendDiscordEmbed('Bot Kicked', `Reason: ${reasonStr}`, ERROR_EMBED_COLOR);
-    
-    await ensureTimeUnfrozen();
-    resetBotState();
-    clearAllIntervals();
-    
-    const isAfkKick = reasonStr.toLowerCase().includes('idle') || 
-                     reasonStr.toLowerCase().includes('afk') || 
-                     reasonStr.toLowerCase().includes('terms of service');
-    
-    if (isAfkKick) {
-      console.log('⚠️  Detected AFK kick from Aternos. Will attempt to rejoin.');
-      consecutiveFailures++;
-      if (AUTO_REJOIN && !isShuttingDown) {
-        console.log(`⏳ Reconnecting after AFK kick in 30 seconds...`);
-        reconnectTimeout = setTimeout(() => {
-          startBot();
-        }, 30000);
-      }
+      if (AUTO_REJOIN) scheduleReconnect();
     } else {
-      consecutiveFailures++;
-      if (AUTO_REJOIN && !isShuttingDown) {
-        reconnectBot();
+      sendDiscordEmbed('Bot Error', msg, ERROR_COLOR);
+    }
+  });
+
+  // ---- END ----
+  bot.on('end', async (reason) => {
+    botReady   = false;
+    isBotOnline = false;
+
+    const r = reason || 'unknown';
+    console.log(`🔌 Bot disconnected: ${r}`);
+
+    await ensureTimeUnfrozen();
+    clearAllHandles();
+    consecutiveFailures++;
+
+    sendDiscordEmbed('Bot Disconnected', `Reason: ${r}`, WARNING_COLOR);
+
+    if (AUTO_REJOIN && !isShuttingDown) scheduleReconnect();
+  });
+
+  // ---- KICKED ----
+  bot.on('kicked', async (reason) => {
+    botReady   = false;
+    isBotOnline = false;
+
+    const reasonStr = typeof reason === 'object'
+      ? JSON.stringify(reason)
+      : String(reason);
+    console.log(`⛔ Bot kicked: ${reasonStr}`);
+
+    await ensureTimeUnfrozen();
+    clearAllHandles();
+
+    sendDiscordEmbed('Bot Kicked', `Reason: ${reasonStr}`, ERROR_COLOR);
+
+    const isAfkKick =
+      reasonStr.toLowerCase().includes('idle') ||
+      reasonStr.toLowerCase().includes('afk')  ||
+      reasonStr.toLowerCase().includes('terms');
+
+    consecutiveFailures++;
+
+    if (AUTO_REJOIN && !isShuttingDown) {
+      if (isAfkKick) {
+        console.log('🔄 AFK kick detected — waiting 30s before rejoin...');
+        reconnectHandle = setTimeout(() => startBot(), 30000);
+      } else {
+        scheduleReconnect();
       }
     }
   });
 
+  // ---- CHAT ----
   bot.on('chat', async (username, message) => {
-    if (username !== botOptions.username) {
-      let trueUsername = username;
-      let uuid = null;
-      
-      if (bot && bot.players) {
-        const player = Object.values(bot.players).find(p =>
-          p.username.replace(/^\./, '') === username.replace(/^\./, '')
-        );
-        if (player) {
-            trueUsername = player.username;
-            uuid = player.uuid;
-        }
-      }
+    if (username === BOT_USERNAME) return;
 
-      sendPlayerMessage(trueUsername, message);
+    let trueUsername = username;
+    let uuid         = null;
 
+    if (bot && bot.players) {
+      const player = Object.values(bot.players).find(
+        p => p.username.replace(/^\./, '') === username.replace(/^\./, ''),
+      );
+      if (player) { trueUsername = player.username; uuid = player.uuid; }
+    }
+
+    sendPlayerMessage(trueUsername, message);
+
+    if (dbConnected && MinecraftChat) {
       try {
         const skinUrl = await getOrCreatePlayerFace(trueUsername, uuid);
-        const chatMessage = new MinecraftChat({ username: trueUsername, chat: message });
-        await chatMessage.save();
+        const doc     = new MinecraftChat({ username: trueUsername, chat: message });
+        await doc.save();
         io.emit('chatMessage', {
-          username: trueUsername,
-          chat: message,
-          timestamp: chatMessage.timestamp,
+          username:  trueUsername,
+          chat:      message,
+          timestamp: doc.timestamp,
           skinUrl,
         });
       } catch (err) {
-        console.error('❌ Error saving chat message to MongoDB:', err.message);
+        console.error('❌ Chat save error:', err.message);
       }
     }
   });
 
+  // ---- PLAYER JOINED ----
   bot.on('playerJoined', async (player) => {
-    if (player.username !== botOptions.username) {
-      console.log(`👋 ${player.username} joined the game`);
-      const skinUrl = await getOrCreatePlayerFace(player.username, player.uuid);
-      player.skinUrl = skinUrl;
+    if (player.username === BOT_USERNAME) return;
+    console.log(`👋 ${player.username} joined`);
+    const skinUrl = await getOrCreatePlayerFace(player.username, player.uuid);
+    player.skinUrl = skinUrl;
 
-      if (CHAT_WEBHOOK) {
-        await axios.post(CHAT_WEBHOOK, {
-          content: `📥 **${player.username}** joined the game.`
-        }).catch(err => console.error('❌ Join Webhook Error:', err.message));
-      }
-
-      sendPlayerList();
-      setTimeout(checkPlayerCount, 1000);
-      setTimeout(checkNearbyPlayers, 2000);
+    if (CHAT_WEBHOOK) {
+      axios.post(CHAT_WEBHOOK, { content: `📥 **${player.username}** joined.` }).catch(() => {});
     }
+
+    io.emit('playerJoined', { username: player.username, skinUrl });
+    setTimeout(checkPlayerCount, 1000);
+    setTimeout(refreshNearbyPlayers, 2000);
   });
 
+  // ---- PLAYER LEFT ----
   bot.on('playerLeft', (player) => {
-    if (player.username !== botOptions.username) {
-      console.log(`👋 ${player.username} left the game`);
-      
-      if (CHAT_WEBHOOK) {
-        axios.post(CHAT_WEBHOOK, {
-          content: `📤 **${player.username}** left the game.`
-        }).catch(err => console.error('❌ Leave Webhook Error:', err.message));
-      }
+    if (player.username === BOT_USERNAME) return;
+    console.log(`👋 ${player.username} left`);
 
-      sendPlayerList();
-      setTimeout(checkPlayerCount, 1000);
-      setTimeout(checkNearbyPlayers, 2000);
+    if (CHAT_WEBHOOK) {
+      axios.post(CHAT_WEBHOOK, { content: `📤 **${player.username}** left.` }).catch(() => {});
     }
+
+    io.emit('playerLeft', { username: player.username });
+    setTimeout(checkPlayerCount, 1000);
+    setTimeout(refreshNearbyPlayers, 2000);
   });
 
+  // ---- HEALTH (monitor only) ----
   bot.on('health', () => {
-    // Health monitoring
+    // In spectator mode health isn't relevant, but we can log anomalies
+    if (bot && bot.health !== undefined && bot.health <= 0 && !isInSpectatorMode) {
+      console.log('💀 Bot health hit 0 (non-spectator?) — rejoining');
+      consecutiveFailures++;
+      scheduleReconnect();
+    }
   });
 }
 
-function reconnectBot() {
-  if (isShuttingDown) {
-    console.log('⚠️  Bot is shutting down, not reconnecting');
-    return;
+// ============================================================================
+// 📋 BOT STATS
+// ============================================================================
+function sendBotStats() {
+  if (!canAct()) return;
+  try {
+    const uptime  = botStartTime ? Math.floor((Date.now() - botStartTime) / 1000) : 0;
+    const h = Math.floor(uptime / 3600);
+    const m = Math.floor((uptime % 3600) / 60);
+    const s = uptime % 60;
+    const pos = bot.entity
+      ? `X:${Math.floor(bot.entity.position.x)} Y:${Math.floor(bot.entity.position.y)} Z:${Math.floor(bot.entity.position.z)}`
+      : 'N/A';
+
+    sendDiscordEmbed('Bot Status', `Report for **${BOT_USERNAME}**`, INFO_COLOR, [
+      { name: 'Uptime',         value: `${h}h ${m}m ${s}s`,               inline: true },
+      { name: 'Position',       value: pos,                                 inline: true },
+      { name: 'Mode',           value: bot.game?.gameMode || 'N/A',         inline: true },
+      { name: 'Memory',         value: `${(process.memoryUsage().rss / 1048576).toFixed(1)} MB`, inline: true },
+      { name: 'Moves',          value: `${movementCount}`,                  inline: true },
+      { name: 'Phase',          value: behaviorPhase,                       inline: true },
+      { name: 'Spectator',      value: isInSpectatorMode ? '✅ Yes' : '❌ No', inline: true },
+      { name: 'Time',           value: isTimeFrozen ? '⏸️ Frozen' : '▶️ Running', inline: true },
+      { name: 'Players Online', value: `${getOnlinePlayersExcludingBot().length}`, inline: true },
+    ]);
+  } catch (err) {
+    console.error('❌ sendBotStats error:', err.message);
   }
-  
-  clearAllIntervals();
-  
-  const baseDelay = RECONNECT_DELAY;
-  const maxDelay = 300000;
-  const delay = Math.min(baseDelay * Math.pow(2, Math.min(consecutiveFailures, 5)), maxDelay);
-  
-  console.log(`⏳ Reconnecting in ${delay / 1000} seconds... (Attempt ${consecutiveFailures + 1})`);
-  reconnectTimeout = setTimeout(() => {
-    startBot();
-  }, delay);
 }
 
-function forceRejoinBot() {
-  if (isShuttingDown) return;
-  
-  clearAllIntervals();
-  console.log(`⏳ Rejoining in ${FIFTEEN_SECONDS / 1000} seconds...`);
-  activityCheckTimeout = setTimeout(() => {
-    startBot();
-  }, FIFTEEN_SECONDS);
-}
-
-function getCpuUsage() {
-  const cpus = os.cpus();
-  let totalIdle = 0, totalTick = 0;
-
-  for (let i = 0; i < cpus.length; i++) {
-    const cpu = cpus[i];
-    for (const type in cpu.times) {
-      totalTick += cpu.times[type];
-    }
-    totalIdle += cpu.times.idle;
-  }
-
-  const idleDifference = totalIdle - lastCpuUsage.idle;
-  const totalDifference = totalTick - lastCpuUsage.total;
-
-  lastCpuUsage = { idle: totalIdle, total: totalTick };
-  if (totalDifference === 0) return 0;
-  return 100 - (100 * idleDifference / totalDifference);
-}
-
-async function getBotStatusPayload() {
-    const botActive = isBotOnline && bot && bot.entity;
-    
-    let onlinePlayersCount = 0;
-    let playerDetails = [];
-    
-    if (botActive) {
-        const playersExcludingBot = getOnlinePlayersExcludingBot();
-        onlinePlayersCount = playersExcludingBot.length;
-        playerDetails = await Promise.all(playersExcludingBot.map(async p => {
-            const skinUrl = await getOrCreatePlayerFace(p.username, p.uuid);
-            return { username: p.username, uuid: p.uuid, skinUrl: skinUrl };
-        }));
-    }
-
-    let diskInfo = { free: 0, total: 0 };
-    try {
-        const pathToCheck = os.platform() === 'win32' ? 'C:' : '/';
-        diskInfo = await diskusage.check(pathToCheck);
-    } catch (err) {
-        // Suppress disk errors
-    }
-
-    return {
-        message: botActive ? "Bot is running!" : "Bot is offline",
-        onlinePlayersCount: botActive ? onlinePlayersCount : 0,
-        playerDetails: botActive ? playerDetails : [],
-        
-        gameMode: botActive && bot.game ? bot.game.gameMode : 'N/A',
-        position: botActive ? {
-            x: Math.floor(bot.entity.position.x),
-            y: Math.floor(bot.entity.position.y),
-            z: Math.floor(bot.entity.position.z)
-        } : 'N/A',
-        
-        uptime: (botActive && botStartTime) ? Math.floor((Date.now() - botStartTime) / 1000) : 0,
-        movements: botActive ? movementCount : 0,
-        memoryUsage: `${Math.round(process.memoryUsage().rss / 1024 / 1024 * 100) / 100} MB`,
-        
-        lastOnline: lastOnlineTime || null,
-        serverHost: currentServerHost,
-        serverPort: currentServerPort,
-        botName: BOT_USERNAME,
-        
-        botHealth: botActive && bot.health !== undefined ? `${Math.round(bot.health)}/20` : 'N/A',
-        botFood: botActive && bot.food !== undefined ? `${Math.round(bot.food)}/20` : 'N/A',
-        botLatency: botActive && bot.player && bot.player.ping !== undefined ? `${bot.player.ping}ms` : 'N/A',
-        
-        serverLoad: os.loadavg()[0].toFixed(2),
-        cpuUsage: getCpuUsage().toFixed(2),
-        diskFree: diskInfo.total > 0 ? `${(diskInfo.free / (1024 ** 3)).toFixed(2)} GB` : 'N/A',
-        diskTotal: diskInfo.total > 0 ? `${(diskInfo.total / (1024 ** 3)).toFixed(2)} GB` : 'N/A',
-        
-        minecraftDay: botActive && bot.time ? bot.time.day : 'N/A',
-        minecraftTime: botActive && bot.time ? bot.time.timeOfDay : 'N/A',
-        serverDifficulty: botActive && bot.game ? bot.game.difficulty : 'N/A',
-        timeFrozen: isTimeFrozen,
-        version: BOT_VERSION,
-    };
-}
+// ============================================================================
+// 🌐 EXPRESS API ROUTES
+// ============================================================================
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+});
 
 app.get('/api/status', async (req, res) => {
   try {
-    const status = await getBotStatusPayload();
-    res.json(status);
+    const payload = await getBotStatusPayload();
+    res.json(payload);
   } catch (err) {
-    console.error('❌ Error in /api/status:', err.message);
-    res.status(500).json({ error: "Internal Server Error" });
+    console.error('❌ /api/status error:', err.message);
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
 app.get('/api/chat', async (req, res) => {
+  if (!dbConnected || !MinecraftChat) {
+    return res.json([]);
+  }
   try {
     const { username, date, search } = req.query;
-    let query = {};
-    if (username) {
-      query.username = username;
-    }
+    const query = {};
+    if (username) query.username = username;
     if (date) {
-      const startOfDay = new Date(date);
-      startOfDay.setHours(0, 0, 0, 0);
-      const endOfDay = new Date(date);
-      endOfDay.setHours(23, 59, 59, 999);
-      query.timestamp = { $gte: startOfDay, $lte: endOfDay };
+      const d0 = new Date(date); d0.setHours(0, 0, 0, 0);
+      const d1 = new Date(date); d1.setHours(23, 59, 59, 999);
+      query.timestamp = { $gte: d0, $lte: d1 };
     }
-    if (search) {
-      query.chat = { $regex: search, $options: 'i' };
-    }
-    const skip = parseInt(req.query.skip) || 0;
-    const limit = parseInt(req.query.limit) || 100;
-    const messages = await MinecraftChat.find(query)
-      .sort({ timestamp: -1 })
-      .skip(skip)
-      .limit(limit);
+    if (search) query.chat = { $regex: search, $options: 'i' };
 
-    const messagesWithFaces = await Promise.all(messages.map(async (msg) => {
+    const skip  = parseInt(req.query.skip,  10) || 0;
+    const limit = parseInt(req.query.limit, 10) || 100;
+
+    const messages = await MinecraftChat.find(query).sort({ timestamp: -1 }).skip(skip).limit(limit);
+    const withFaces = await Promise.all(messages.map(async msg => {
       const skinUrl = await getOrCreatePlayerFace(msg.username, null);
       return { ...msg.toObject(), skinUrl };
     }));
-
-    res.json(messagesWithFaces);
+    res.json(withFaces);
   } catch (err) {
-    console.error('❌ Error fetching chat history:', err.message);
+    console.error('❌ /api/chat error:', err.message);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
 app.get('/api/chat/usernames', async (req, res) => {
+  if (!dbConnected || !MinecraftChat) return res.json([]);
   try {
     const usernames = await MinecraftChat.distinct('username');
     res.json(usernames);
   } catch (err) {
-    console.error('❌ Error fetching distinct usernames:', err.message);
+    console.error('❌ /api/chat/usernames error:', err.message);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
-io.on('connection', (socket) => {
-  console.log('🔌 Client connected to Socket.IO');
+// Manual reconnect endpoint
+app.post('/api/reconnect', (req, res) => {
+  console.log('🔄 Manual reconnect triggered via API');
+  res.json({ message: 'Reconnect initiated' });
+  setTimeout(() => {
+    consecutiveFailures = 0;
+    startBot();
+  }, 1000);
 });
 
+// Health check (for Render.com uptime)
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    botOnline: isBotOnline,
+    botReady,
+    isSpectator: isInSpectatorMode,
+    uptime: process.uptime(),
+  });
+});
+
+// ============================================================================
+// 🔌 SOCKET.IO
+// ============================================================================
+io.on('connection', (socket) => {
+  console.log(`🔌 Dashboard client connected [${socket.id}]`);
+
+  // Send current status immediately on connect
+  getBotStatusPayload().then(payload => {
+    socket.emit('botStatusUpdate', payload);
+  }).catch(() => {});
+
+  socket.on('disconnect', () => {
+    console.log(`🔌 Dashboard client disconnected [${socket.id}]`);
+  });
+});
+
+// Periodic status broadcast
 setInterval(async () => {
   try {
-    const botStatus = await getBotStatusPayload();
-    io.emit('botStatusUpdate', botStatus);
+    const payload = await getBotStatusPayload();
+    io.emit('botStatusUpdate', payload);
   } catch (err) {
-    console.error('❌ Error emitting status update via Socket.IO:', err.message);
+    console.error('❌ Socket.IO broadcast error:', err.message);
   }
-}, SOCKET_IO_UPDATE_INTERVAL);
+}, SOCKET_UPDATE_MS);
 
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
-});
+// ============================================================================
+// 🔁 RENDER.COM KEEP-ALIVE (self-ping to prevent spin-down on free tier)
+// ============================================================================
+function startSelfPing() {
+  if (!SELF_PING) return;
+  const selfUrl = process.env.RENDER_EXTERNAL_URL
+    ? `${process.env.RENDER_EXTERNAL_URL}/health`
+    : `http://localhost:${WEB_SERVER_PORT}/health`;
 
-server.listen(WEB_SERVER_PORT, () => {
-  console.log(`🌐 Web monitoring server started on port ${WEB_SERVER_PORT}`);
-  sendDiscordEmbed('Web Server', `Web monitoring server started on port ${WEB_SERVER_PORT}`, DEFAULT_EMBED_COLOR);
-});
+  setInterval(async () => {
+    try {
+      await axios.get(selfUrl, { timeout: 10000 });
+      console.log(`🏓 Self-ping OK → ${selfUrl}`);
+    } catch (err) {
+      console.error(`❌ Self-ping failed: ${err.message}`);
+    }
+  }, KEEP_ALIVE_MS);
+}
 
-process.on('SIGINT', async () => {
-  console.log('\n⚠️  Received SIGINT, shutting down gracefully...');
+// ============================================================================
+// 🛑 GRACEFUL SHUTDOWN
+// ============================================================================
+async function gracefulShutdown(signal) {
+  console.log(`\n⚠️  ${signal} received — shutting down gracefully...`);
   isShuttingDown = true;
-  
+  botReady       = false;
+
   await ensureTimeUnfrozen();
-  
+
   if (bot) {
-    await sendDiscordEmbed('Bot Shutdown', 'Bot is shutting down gracefully', WARNING_EMBED_COLOR);
-    bot.quit();
+    try {
+      await sendDiscordEmbed('Bot Shutdown', `${BOT_USERNAME} shutting down (${signal})`, WARNING_COLOR);
+      bot.quit('Shutdown');
+    } catch (_) {}
   }
-  
-  clearAllIntervals();
-  
+
+  clearAllHandles();
+
   setTimeout(() => {
     console.log('✅ Shutdown complete');
     process.exit(0);
-  }, 2000);
+  }, 2500);
+}
+
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+process.on('uncaughtException', (err) => {
+  console.error('💥 Uncaught Exception:', err.message, err.stack);
+  // Don't crash — just log and continue
 });
 
-process.on('SIGTERM', async () => {
-  console.log('\n⚠️  Received SIGTERM, shutting down gracefully...');
-  isShuttingDown = true;
-  
-  await ensureTimeUnfrozen();
-  
-  if (bot) {
-    await sendDiscordEmbed('Bot Shutdown', 'Bot is shutting down gracefully', WARNING_EMBED_COLOR);
-    bot.quit();
-  }
-  
-  clearAllIntervals();
-  
-  setTimeout(() => {
-    console.log('✅ Shutdown complete');
-    process.exit(0);
-  }, 2000);
+process.on('unhandledRejection', (reason) => {
+  console.error('💥 Unhandled Rejection:', reason);
 });
 
-startBot();
+// ============================================================================
+// 🚀 BOOT SEQUENCE
+// ============================================================================
+async function boot() {
+  console.log('='.repeat(60));
+  console.log('  🍃 Leaf Dashboard — Minecraft AFK Bot');
+  console.log(`  Host:    ${BOT_HOST}:${BOT_PORT}`);
+  console.log(`  Bot:     ${BOT_USERNAME} (MC ${BOT_VERSION})`);
+  console.log(`  Version: mineflayer 4.35.0`);
+  console.log(`  Mode:    Spectator-only movement engine`);
+  console.log('='.repeat(60));
+
+  // Start web server first so Render health check passes
+  await new Promise(resolve => {
+    server.listen(WEB_SERVER_PORT, '0.0.0.0', () => {
+      console.log(`🌐 Web server listening on port ${WEB_SERVER_PORT}`);
+      resolve();
+    });
+  });
+
+  // Connect database (non-blocking)
+  connectDatabase().catch(() => {});
+
+  // Self-ping for Render free tier
+  startSelfPing();
+
+  // Announce web server start
+  sendDiscordEmbed(
+    'Server Started',
+    `Web monitoring on port ${WEB_SERVER_PORT}\nBot will connect to ${BOT_HOST}:${BOT_PORT}`,
+    DEFAULT_COLOR,
+  );
+
+  // Small delay then start bot
+  await sleep(2000);
+  startBot();
+}
+
+boot();

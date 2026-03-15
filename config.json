@@ -17,13 +17,14 @@
     "mongoUri": ""
   },
   "intervals": {
-    "reconnect": 3000,
+    "reconnectDelays": [3000, 5000, 10000],
     "socketUpdate": 1000,
-    "activityCheck": 5000
+    "activityCheck": 5000,
+    "keepAlive": 840000
   },
   "timeLimits": {
     "oneHour": 3600000,
-    "fifteenSeconds": 5000
+    "spawnTimeout": 30000
   },
   "embedColors": {
     "default": 3447003,
@@ -46,6 +47,8 @@
   "features": {
     "autoTimeFreeze": true,
     "antiAFK": true,
-    "autoRejoin": true
+    "autoRejoin": true,
+    "selfPing": true,
+    "spectatorOnly": true
   }
 }
