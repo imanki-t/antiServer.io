@@ -2,7 +2,6 @@
 
 const mineflayer = require('mineflayer');
 const axios = require('axios');
-const Vec3 = require('vec3');
 const express = require('express');
 const path = require('path');
 const os = require('os');
@@ -45,14 +44,12 @@ const ACTIVITY_CHECK_MS   = config.intervals.activityCheck   || 5000;
 const KEEP_ALIVE_MS       = config.intervals.keepAlive       || 840000; // 14 min
 
 const ONE_HOUR            = config.timeLimits.oneHour        || 3600000;
-const SPAWN_TIMEOUT_MS    = config.timeLimits.spawnTimeout   || 30000;
 
 const DEFAULT_COLOR  = config.embedColors.default;
 const SUCCESS_COLOR  = config.embedColors.success;
 const WARNING_COLOR  = config.embedColors.warning;
 const ERROR_COLOR    = config.embedColors.error;
 const INFO_COLOR     = config.embedColors.info;
-const CHAT_COLOR     = config.embedColors.chat;
 
 const FACES = config.faces;
 
@@ -60,7 +57,6 @@ const AUTO_TIME_FREEZE = config.features.autoTimeFreeze;
 const ANTI_AFK         = config.features.antiAFK;
 const AUTO_REJOIN      = config.features.autoRejoin;
 const SELF_PING        = config.features.selfPing;
-const SPECTATOR_ONLY   = config.features.spectatorOnly;
 
 // ============================================================================
 // 🌐 EXPRESS + SOCKET.IO SETUP
@@ -333,14 +329,16 @@ async function unfreezeTime() {
 }
 
 async function ensureTimeUnfrozen() {
-  if (isTimeFrozen && bot && isBotOnline) {
-    try {
-      bot.chat('/tick unfreeze');
-      isTimeFrozen = false;
-      console.log('✅ Time unfrozen before disconnect');
-      await new Promise(r => setTimeout(r, 800));
-    } catch (_) {}
-  }
+  // NOTE: deliberately does NOT check isBotOnline — this is called
+  // during disconnect where isBotOnline is already false, so we only
+  // check isTimeFrozen and that the bot socket is still open.
+  if (!isTimeFrozen || !bot) return;
+  try {
+    bot.chat('/tick unfreeze');
+    isTimeFrozen = false;
+    console.log('✅ Time unfrozen before disconnect');
+    await new Promise(r => setTimeout(r, 800));
+  } catch (_) {}
 }
 
 function checkPlayerCount() {
@@ -1149,13 +1147,13 @@ function scheduleNextAction() {
 // ============================================================================
 // 🏃 ACTIVITY CHECK
 // ============================================================================
-function checkBotActivity() {
+async function checkBotActivity() {
   if (!botStartTime || !isBotOnline || !ANTI_AFK) return;
   const uptime = Date.now() - botStartTime;
   if (uptime >= ONE_HOUR) {
     console.log('⏰ 1-hour uptime reached — rejoining to avoid AFK detection');
     sendDiscordEmbed('AFK Prevention', 'Bot active 1+ hour — rejoining server', WARNING_COLOR);
-    forceRejoin();
+    await forceRejoin();
   }
 }
 
@@ -1189,8 +1187,10 @@ function scheduleReconnect() {
   }), delay);
 }
 
-function forceRejoin() {
+async function forceRejoin() {
   if (isShuttingDown) return;
+  // Must unfreeze time BEFORE killing the current connection
+  await ensureTimeUnfrozen();
   clearAllHandles();
   console.log(`⏳ Force-rejoining in 5s...`);
   reconnectHandle = setTimeout(() => startBot().catch(err => {
@@ -1564,11 +1564,24 @@ async function startBot() {
 
   // ---- ERROR ----
   bot.on('error', (err) => {
-    botReady   = false;
-    isBotOnline = false;
+    // Guard: don't double-process if end fires right after
+    if (!isBotOnline && !botReady) return;
 
     const msg = err.message || String(err);
     console.error('❌ Bot error:', msg);
+
+    // Best-effort time unfreeze synchronously (error handler can't be async)
+    if (isTimeFrozen && bot) {
+      try { bot.chat('/tick unfreeze'); } catch (_) {}
+      isTimeFrozen = false;
+      console.log('✅ Time unfrozen on error');
+    }
+
+    botReady    = false;
+    isBotOnline = false;
+    resetBotState();
+    clearAllHandles();
+    consecutiveFailures++;
 
     const isKeepaliveTimeout = msg.includes('timed out after');
     const isNetworkError =
@@ -1580,17 +1593,12 @@ async function startBot() {
       msg.includes('PartialReadError') ||
       msg.includes('Unexpected buffer end');
 
-    clearAllHandles();
-    consecutiveFailures++;
-
     if (isKeepaliveTimeout) {
-      // Keepalive timeout = high latency spike, not a true disconnect.
-      // Wait 20s before retrying so we don't hammer the server.
       console.log('⚠️  Keepalive timeout — waiting 20s before reconnect (high latency)');
       sendDiscordEmbed('Keepalive Timeout', 'High latency to Aternos — reconnecting in 20s', WARNING_COLOR);
       if (AUTO_REJOIN) {
-        reconnectHandle = setTimeout(() => startBot().catch(err => {
-          console.error('❌ startBot error:', err.message);
+        reconnectHandle = setTimeout(() => startBot().catch(e => {
+          console.error('❌ startBot error:', e.message);
         }), 20000);
       }
     } else if (isNetworkError) {
@@ -1603,13 +1611,19 @@ async function startBot() {
 
   // ---- END ----
   bot.on('end', async (reason) => {
-    botReady   = false;
-    isBotOnline = false;
+    // Guard: if already reset (e.g. error fired first), don't double-process
+    if (!isBotOnline && !botReady) return;
 
     const r = reason || 'unknown';
     console.log(`🔌 Bot disconnected: ${r}`);
 
+    // Unfreeze BEFORE marking offline — ensureTimeUnfrozen needs bot alive
     await ensureTimeUnfrozen();
+
+    // Now reset all state
+    botReady    = false;
+    isBotOnline = false;
+    resetBotState();
     clearAllHandles();
     consecutiveFailures++;
 
@@ -1620,15 +1634,20 @@ async function startBot() {
 
   // ---- KICKED ----
   bot.on('kicked', async (reason) => {
-    botReady   = false;
-    isBotOnline = false;
+    // Guard against double-fire with end event
+    if (!isBotOnline && !botReady) return;
 
     const reasonStr = typeof reason === 'object'
       ? JSON.stringify(reason)
       : String(reason);
     console.log(`⛔ Bot kicked: ${reasonStr}`);
 
+    // Unfreeze BEFORE marking offline
     await ensureTimeUnfrozen();
+
+    botReady    = false;
+    isBotOnline = false;
+    resetBotState();
     clearAllHandles();
 
     sendDiscordEmbed('Bot Kicked', `Reason: ${reasonStr}`, ERROR_COLOR);
@@ -1883,26 +1902,54 @@ function startSelfPing() {
 // ============================================================================
 // 🛑 GRACEFUL SHUTDOWN
 // ============================================================================
-async function gracefulShutdown(signal) {
-  console.log(`\n⚠️  ${signal} received — shutting down gracefully...`);
-  isShuttingDown = true;
-  botReady       = false;
+let shutdownInProgress = false;
 
+async function gracefulShutdown(signal) {
+  // Guard against double SIGTERM (Render sometimes sends both SIGINT + SIGTERM)
+  if (shutdownInProgress) {
+    console.log(`⚠️  ${signal} received again — already shutting down, forcing exit`);
+    process.exit(0);
+    return;
+  }
+  shutdownInProgress = true;
+  isShuttingDown     = true;
+  botReady           = false;
+
+  console.log(`\n⚠️  ${signal} received — shutting down gracefully...`);
+
+  // 1. Unfreeze time first (while bot connection still live)
   await ensureTimeUnfrozen();
 
-  if (bot) {
+  // 2. Notify Discord
+  if (DISCORD_WEBHOOK) {
     try {
       await sendDiscordEmbed('Bot Shutdown', `${BOT_USERNAME} shutting down (${signal})`, WARNING_COLOR);
-      bot.quit('Shutdown');
     } catch (_) {}
   }
 
+  // 3. Disconnect bot — suppress the 'end' event reconnect since isShuttingDown=true
+  if (bot) {
+    try {
+      bot.removeAllListeners('end');
+      bot.removeAllListeners('error');
+      bot.quit('Shutdown');
+    } catch (_) {}
+    bot = null;
+  }
+
+  // 4. Clear all timers
   clearAllHandles();
 
-  setTimeout(() => {
-    console.log('✅ Shutdown complete');
-    process.exit(0);
-  }, 2500);
+  // 5. Close HTTP server (stop accepting new connections)
+  await new Promise(resolve => server.close(resolve)).catch(() => {});
+
+  // 6. Close MongoDB connection
+  if (dbConnected) {
+    await mongoose.disconnect().catch(() => {});
+  }
+
+  console.log('✅ Shutdown complete');
+  process.exit(0);
 }
 
 process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
