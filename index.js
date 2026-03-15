@@ -58,7 +58,7 @@ const botOptions = {
   username: BOT_USERNAME,
   version: BOT_VERSION,
   auth: 'offline',
-  connectTimeout: null,
+  connectTimeout: 30000,
 };
 
 let bot = null;
