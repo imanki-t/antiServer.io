@@ -1409,47 +1409,23 @@ async function startBot() {
     return;
   }
 
-  // ---- LOGIN EVENT — fires when TCP connection is established ----
-  // This proves the bot IS talking to the server. Cancel the short
-  // pre-login timeout and start a much longer spawn timeout instead,
-  // because Aternos can take 60-90s to load chunks after login.
+  // ---- LOGIN EVENT ----
+  // Just log that TCP connection is established - no timeout needed.
+  // If the server is genuinely dead, the OS TCP stack will fire 'end'.
   bot.once('login', () => {
-    console.log('🔗 Login established — waiting for world to load (up to 90s)...');
+    console.log('🔗 Login established — waiting for world to load...');
+  });
 
-    // Cancel any existing spawn watchdog
+  // No pre-login or post-login timeouts — null everywhere.
+  // Aternos can take any amount of time. If something goes wrong,
+  // the 'error' or 'end' event will always fire and trigger reconnect.
+
+  // ---- SPAWN ----
+  bot.once('spawn', async () => {
     if (spawnTimeoutHandle) {
       clearTimeout(spawnTimeoutHandle);
       spawnTimeoutHandle = null;
     }
-
-    // Start a generous post-login spawn timeout (90s)
-    // Aternos is slow — chunk loading after login can take a long time
-    spawnTimeoutHandle = setTimeout(() => {
-      if (!isBotOnline) {
-        console.log('⏰ World never loaded after login (90s) — retrying...');
-        consecutiveFailures++;
-        try { bot.quit('World load timeout'); } catch (_) {}
-        scheduleReconnect();
-      }
-    }, 90000);
-  });
-
-  // ---- PRE-LOGIN TIMEOUT — if TCP connection never establishes ----
-  // Short: 30s is fine here because if login doesn't fire in 30s,
-  // the server is genuinely unreachable (offline, wrong port, etc.)
-  spawnTimeoutHandle = setTimeout(() => {
-    if (!isBotOnline) {
-      console.log(`⏰ Connection timeout — server unreachable after 30s (offline or wrong port?)`);
-      consecutiveFailures++;
-      try { bot.quit('Connection timeout'); } catch (_) {}
-      scheduleReconnect();
-    }
-  }, 30000);
-
-  // ---- SPAWN ----
-  bot.once('spawn', async () => {
-    clearTimeout(spawnTimeoutHandle);
-    spawnTimeoutHandle = null;
 
     console.log('✅ Bot spawned on ' + currentServerHost + ':' + currentServerPort);
 
