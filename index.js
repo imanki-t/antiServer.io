@@ -1326,29 +1326,39 @@ async function getBotStatusPayload() {
 // ============================================================================
 // ============================================================================
 // 🔍 DNS SRV PORT RESOLVER
-// Aternos updates _minecraft._tcp.<host> SRV record every server restart
-// with the current port. We only extract the PORT from SRV — we always
-// connect using the original hostname (BOT_HOST) so Aternos routes the
-// connection correctly. Using record.name directly bypasses Aternos routing
-// and causes "server doesn't exist" errors.
+// Forces fresh DNS lookup every time by using Google + Cloudflare DNS
+// directly — bypasses any OS/ISP/Render DNS cache that returns stale ports.
+// Only extracts the PORT from SRV, always connects via original hostname.
 // ============================================================================
 async function resolveServerPort(host) {
   const srvName = `_minecraft._tcp.${host}`;
-  try {
-    const records = await dns.resolveSrv(srvName);
-    if (records && records.length > 0) {
-      records.sort((a, b) => a.priority - b.priority);
-      const record = records[0];
-      console.log(`🔍 SRV lookup ${srvName} → port ${record.port} (host kept as ${host})`);
-      // IMPORTANT: always return the ORIGINAL host, only take the port
-      return { host: host, port: record.port };
+
+  // Force fresh lookups via public resolvers to bypass cached stale ports
+  const resolvers = ['8.8.8.8', '1.1.1.1', '8.8.4.4'];
+
+  for (const resolver of resolvers) {
+    try {
+      const freshDns = new (require('dns').Resolver)();
+      freshDns.setServers([resolver]);
+      const records = await new Promise((resolve, reject) => {
+        freshDns.resolveSrv(srvName, (err, records) => {
+          if (err) reject(err);
+          else resolve(records);
+        });
+      });
+      if (records && records.length > 0) {
+        records.sort((a, b) => a.priority - b.priority);
+        const record = records[0];
+        console.log(`🔍 SRV via ${resolver}: ${srvName} → port ${record.port}`);
+        return { host: host, port: record.port };
+      }
+    } catch (err) {
+      console.log(`⚠️  SRV via ${resolver} failed: ${err.message}`);
     }
-  } catch (err) {
-    console.log(`⚠️  SRV lookup failed: ${err.message}`);
   }
 
   // Fallback: use config port
-  console.log(`⚠️  SRV failed — using config port ${BOT_PORT}`);
+  console.log(`⚠️  All SRV lookups failed — using config port ${BOT_PORT}`);
   return { host: host, port: BOT_PORT };
 }
 
@@ -1788,6 +1798,13 @@ app.get('/api/chat/usernames', async (req, res) => {
   }
 });
 
+// Old-instance shutdown endpoint — called by new deploy to cleanly stop this process
+app.post('/api/shutdown-old', (req, res) => {
+  res.json({ message: 'Shutting down old instance', pid: process.pid });
+  console.log('🔄 New deployment detected — shutting down this old instance');
+  setTimeout(() => gracefulShutdown('OLD_INSTANCE'), 500);
+});
+
 // Manual reconnect endpoint
 app.post('/api/reconnect', (req, res) => {
   console.log('🔄 Manual reconnect triggered via API');
@@ -1929,7 +1946,26 @@ async function boot() {
   console.log(`  Bot:     ${BOT_USERNAME} (MC ${BOT_VERSION})`);
   console.log(`  Version: mineflayer 4.35.0`);
   console.log(`  Mode:    Spectator-only movement engine`);
+  console.log(`  PID:     ${process.pid}`);
   console.log('='.repeat(60));
+
+  // ---- KILL OLD INSTANCE (Render zero-downtime deploy protection) ----
+  // When Render deploys a new version, the old instance keeps running
+  // alongside the new one until health checks pass. Both try to connect
+  // the bot simultaneously. We hit our own public URL's /shutdown endpoint
+  // to gracefully stop the old instance before we start.
+  const publicUrl = process.env.RENDER_EXTERNAL_URL;
+  if (publicUrl) {
+    try {
+      console.log(`🔄 Signalling old instance to shut down...`);
+      await axios.post(`${publicUrl}/api/shutdown-old`, {}, { timeout: 5000 });
+      console.log(`✅ Old instance notified — waiting 3s for it to release resources`);
+      await sleep(3000);
+    } catch (_) {
+      // Old instance might already be gone — that's fine
+      console.log(`ℹ️  No old instance found or already gone`);
+    }
+  }
 
   // Start web server first so Render health check passes
   await new Promise(resolve => {
