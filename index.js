@@ -1332,41 +1332,68 @@ async function getBotStatusPayload() {
 
 // ============================================================================
 // ============================================================================
-// 🔍 DNS SRV PORT RESOLVER
-// Forces fresh DNS lookup every time by using Google + Cloudflare DNS
-// directly — bypasses any OS/ISP/Render DNS cache that returns stale ports.
-// Only extracts the PORT from SRV, always connects via original hostname.
+// 🔍 DNS SRV RESOLVER
+// Aternos dynamically starts servers on different hosts every time.
+// SRV record returns: name (backend host) + port.
+// We resolve BOTH via Google/Cloudflare DNS directly to bypass OS cache.
+// Then connect to the fresh IP directly — Aternos routes by port, not hostname.
 // ============================================================================
-async function resolveServerPort(host) {
+async function resolveServerAddress(host) {
   const srvName = `_minecraft._tcp.${host}`;
+  const publicDns = ['8.8.8.8', '1.1.1.1', '8.8.4.4'];
 
-  // Force fresh lookups via public resolvers to bypass cached stale ports
-  const resolvers = ['8.8.8.8', '1.1.1.1', '8.8.4.4'];
+  let srvTarget = null;
+  let srvPort   = BOT_PORT;
 
-  for (const resolver of resolvers) {
+  // Step 1: Get SRV record (name + port) via fresh public DNS
+  for (const resolver of publicDns) {
     try {
       const freshDns = new (require('dns').Resolver)();
       freshDns.setServers([resolver]);
       const records = await new Promise((resolve, reject) => {
-        freshDns.resolveSrv(srvName, (err, records) => {
-          if (err) reject(err);
-          else resolve(records);
-        });
+        freshDns.resolveSrv(srvName, (err, recs) => err ? reject(err) : resolve(recs));
       });
       if (records && records.length > 0) {
         records.sort((a, b) => a.priority - b.priority);
-        const record = records[0];
-        console.log(`🔍 SRV via ${resolver}: ${srvName} → port ${record.port}`);
-        return { host: host, port: record.port };
+        srvTarget = records[0].name;
+        srvPort   = records[0].port;
+        console.log(`🔍 SRV via ${resolver}: ${srvName} → ${srvTarget}:${srvPort}`);
+        break;
       }
     } catch (err) {
       console.log(`⚠️  SRV via ${resolver} failed: ${err.message}`);
     }
   }
 
-  // Fallback: use config port
-  console.log(`⚠️  All SRV lookups failed — using config port ${BOT_PORT}`);
-  return { host: host, port: BOT_PORT };
+  if (!srvTarget) {
+    console.log(`⚠️  SRV failed — using config values ${host}:${BOT_PORT}`);
+    return { connectHost: host, connectPort: BOT_PORT, displayHost: host };
+  }
+
+  // Step 2: Resolve the SRV target hostname to a fresh IP via public DNS
+  // This bypasses the OS/Render DNS cache which returns stale Aternos IPs
+  for (const resolver of publicDns) {
+    try {
+      const freshDns = new (require('dns').Resolver)();
+      freshDns.setServers([resolver]);
+      const addresses = await new Promise((resolve, reject) => {
+        freshDns.resolve4(srvTarget, (err, addrs) => err ? reject(err) : resolve(addrs));
+      });
+      if (addresses && addresses.length > 0) {
+        const ip = addresses[0];
+        console.log(`🔍 A record via ${resolver}: ${srvTarget} → ${ip}`);
+        console.log(`🎯 Final: connect to ${ip}:${srvPort} (display: ${host})`);
+        // Connect to the fresh IP directly, show original hostname on dashboard
+        return { connectHost: ip, connectPort: srvPort, displayHost: host };
+      }
+    } catch (err) {
+      console.log(`⚠️  A record via ${resolver} failed: ${err.message}`);
+    }
+  }
+
+  // Fallback: use SRV target name without IP resolution
+  console.log(`⚠️  IP resolution failed — using SRV target directly: ${srvTarget}:${srvPort}`);
+  return { connectHost: srvTarget, connectPort: srvPort, displayHost: host };
 }
 
 // ============================================================================
@@ -1391,17 +1418,17 @@ async function startBot() {
 
   resetBotState();
 
-  // Resolve current port from Aternos DNS SRV — host stays as BOT_HOST
-  console.log(`\n🔍 Resolving port for ${BOT_HOST}...`);
-  const resolved = await resolveServerPort(BOT_HOST);
-  currentServerHost = BOT_HOST; // always the original hostname for display + routing
-  currentServerPort = resolved.port;
+  // Resolve fresh IP + port via public DNS — bypasses OS cache
+  console.log(`\n🔍 Resolving address for ${BOT_HOST}...`);
+  const resolved    = await resolveServerAddress(BOT_HOST);
+  currentServerHost = resolved.displayHost; // always original hostname for display
+  currentServerPort = resolved.connectPort;
 
-  console.log(`\n🚀 Connecting to ${currentServerHost}:${currentServerPort} as ${BOT_USERNAME} (${BOT_VERSION})...`);
+  console.log(`\n🚀 Connecting to ${resolved.connectHost}:${resolved.connectPort} as ${BOT_USERNAME} (${BOT_VERSION})...`);
 
   const botOptions = {
-    host:                 currentServerHost,
-    port:                 currentServerPort,
+    host:                 resolved.connectHost, // fresh IP — bypasses stale OS DNS
+    port:                 resolved.connectPort,
     username:             BOT_USERNAME,
     version:              BOT_VERSION,
     keepAlive:            true,
