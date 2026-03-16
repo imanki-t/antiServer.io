@@ -1,8 +1,8 @@
 {
   "bot": {
-    "host": "NoobsGang.aternos.me",
+    "host": "cygnusstar.aternos.me",
     "port": 25565,
-    "username": "NOOB",
+    "username": "CYGNUS",
     "version": "1.21.11",
     "_note": "Port is auto-resolved from Aternos DNS SRV record on every connect. The port field here is only used as a last resort fallback if DNS completely fails."
   },
@@ -18,7 +18,7 @@
     "mongoUri": ""
   },
   "intervals": {
-    "reconnectDelays": [3000, 4000, 5000],
+    "reconnectDelays": [4000, 8000, 10000],
     "socketUpdate": 1000,
     "activityCheck": 5000,
     "keepAlive": 840000
