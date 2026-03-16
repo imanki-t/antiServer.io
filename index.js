@@ -1324,40 +1324,32 @@ async function getBotStatusPayload() {
 }
 
 // ============================================================================
-// 🔍 DNS SRV RESOLVER
-// Aternos updates _minecraft._tcp.<host> SRV record every server restart
-// with the current real IP + port. We look this up before every connection
-// so the bot always uses the correct port automatically.
 // ============================================================================
-async function resolveServerAddress(host) {
+// 🔍 DNS SRV PORT RESOLVER
+// Aternos updates _minecraft._tcp.<host> SRV record every server restart
+// with the current port. We only extract the PORT from SRV — we always
+// connect using the original hostname (BOT_HOST) so Aternos routes the
+// connection correctly. Using record.name directly bypasses Aternos routing
+// and causes "server doesn't exist" errors.
+// ============================================================================
+async function resolveServerPort(host) {
   const srvName = `_minecraft._tcp.${host}`;
   try {
     const records = await dns.resolveSrv(srvName);
     if (records && records.length > 0) {
-      // Pick the highest-priority record (lowest priority value)
       records.sort((a, b) => a.priority - b.priority);
       const record = records[0];
-      console.log(`🔍 SRV lookup ${srvName} → ${record.name}:${record.port}`);
-      return { host: record.name, port: record.port };
+      console.log(`🔍 SRV lookup ${srvName} → port ${record.port} (host kept as ${host})`);
+      // IMPORTANT: always return the ORIGINAL host, only take the port
+      return { host: host, port: record.port };
     }
   } catch (err) {
-    console.log(`⚠️  SRV lookup failed for ${srvName}: ${err.message}`);
+    console.log(`⚠️  SRV lookup failed: ${err.message}`);
   }
 
-  // Fallback: try plain A record — port stays as config value
-  try {
-    const addresses = await dns.resolve4(host);
-    if (addresses && addresses.length > 0) {
-      console.log(`🔍 A record lookup ${host} → ${addresses[0]}:${BOT_PORT} (using config port)`);
-      return { host: addresses[0], port: BOT_PORT };
-    }
-  } catch (err) {
-    console.log(`⚠️  A record lookup also failed: ${err.message}`);
-  }
-
-  // Last resort: use config values as-is
-  console.log(`⚠️  DNS resolution failed — falling back to config: ${host}:${BOT_PORT}`);
-  return { host, port: BOT_PORT };
+  // Fallback: use config port
+  console.log(`⚠️  SRV failed — using config port ${BOT_PORT}`);
+  return { host: host, port: BOT_PORT };
 }
 
 // ============================================================================
@@ -1382,10 +1374,10 @@ async function startBot() {
 
   resetBotState();
 
-  // --- Resolve current IP + port from Aternos DNS SRV record ---
-  console.log(`\n🔍 Resolving DNS for ${BOT_HOST}...`);
-  const resolved = await resolveServerAddress(BOT_HOST);
-  currentServerHost = resolved.host;
+  // Resolve current port from Aternos DNS SRV — host stays as BOT_HOST
+  console.log(`\n🔍 Resolving port for ${BOT_HOST}...`);
+  const resolved = await resolveServerPort(BOT_HOST);
+  currentServerHost = BOT_HOST; // always the original hostname for display + routing
   currentServerPort = resolved.port;
 
   console.log(`\n🚀 Connecting to ${currentServerHost}:${currentServerPort} as ${BOT_USERNAME} (${BOT_VERSION})...`);
