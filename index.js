@@ -1398,13 +1398,6 @@ async function startBot() {
     username:             BOT_USERNAME,
     version:              BOT_VERSION,
     keepAlive:            true,
-    // null = disable client-side keepalive timeout entirely.
-    // Render→Aternos latency is unpredictable and spikes past any fixed
-    // value. The bot still RESPONDS to server keepalives — it just won't
-    // self-disconnect if the round-trip takes too long. The OS TCP stack
-    // handles actual dead connections via socket.setKeepAlive below.
-    checkTimeoutInterval: null,
-    closeTimeout:         null,
     hideErrors:           false,
     chatLengthLimit:      256,
     auth:                 'offline',
@@ -1417,6 +1410,22 @@ async function startBot() {
     consecutiveFailures++;
     scheduleReconnect();
     return;
+  }
+
+  // ---- PATCH KEEPALIVE — remove minecraft-protocol's built-in 30s timeout ----
+  // keepalive.js does: options.checkTimeoutInterval || 30000
+  // So passing null/0/false still uses 30s. The ONLY way to disable it is to
+  // replace the keep_alive listener entirely after bot creation.
+  // We still respond to every keepalive packet (required or server kicks us),
+  // but we never set the watchdog timer that causes "timed out after 30000ms".
+  if (bot._client) {
+    bot._client.removeAllListeners('keep_alive');
+    bot._client.on('keep_alive', (packet) => {
+      try {
+        bot._client.write('keep_alive', { keepAliveId: packet.keepAliveId });
+      } catch (_) {}
+    });
+    console.log('✅ Keepalive timeout patched — responding to server keepalives without timeout');
   }
 
   // ---- LOGIN EVENT ----
