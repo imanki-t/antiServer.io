@@ -5,9 +5,9 @@ const express = require('express');
 const path = require('path');
 const os = require('os');
 
-const BOT_HOST = process.env.BOT_HOST || 'Leafsong.aternos.me';
-const BOT_PORT = parseInt(process.env.BOT_PORT, 10) || 36915;
-const BOT_USERNAME = process.env.BOT_USERNAME || 'LeafBOT';
+const BOT_HOST = process.env.BOT_HOST || 'NoobsGang.aternos.me';
+const BOT_PORT = parseInt(process.env.BOT_PORT, 10) || 45944;
+const BOT_USERNAME = process.env.BOT_USERNAME || 'NOOB';
 const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK;
 const CHAT_WEBHOOK = process.env.CHAT_WEBHOOK;
 const MESSAGE_WEBHOOK = process.env.MESSAGE_WEBHOOK;
