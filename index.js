@@ -118,6 +118,7 @@ async function connectDatabase() {
 let bot                = null;
 let botReady           = false;  // true ONLY when bot is spawned and confirmed alive
 let isBotOnline        = false;
+let isReconnecting     = false;  // true while actively attempting to reconnect
 let isInSpectatorMode  = false;
 let isTimeFrozen       = false;
 let isShuttingDown     = false;
@@ -204,6 +205,7 @@ function clearAllHandles() {
 function resetBotState() {
   isBotOnline        = false;
   botReady           = false;
+  isReconnecting     = false;
   isInSpectatorMode  = false;
   isTimeFrozen       = false;
   botStartTime       = null;
@@ -1180,11 +1182,15 @@ function scheduleReconnect() {
     return;
   }
   clearAllHandles();
+  isReconnecting = true;
   const delay = getReconnectDelay();
-  console.log(`⏳ Reconnecting in ${delay / 1000}s (failure #${consecutiveFailures + 1})...`);
-  reconnectHandle = setTimeout(() => startBot().catch(err => {
-    console.error('❌ startBot error:', err.message);
-  }), delay);
+  console.log(`⏳ Reconnecting in ${delay / 1000}s (failure #${consecutiveFailures})...`);
+  reconnectHandle = setTimeout(() => {
+    isReconnecting = false;
+    startBot().catch(err => {
+      console.error('❌ startBot error:', err.message);
+    });
+  }, delay);
 }
 
 async function forceRejoin() {
@@ -1286,7 +1292,8 @@ async function getBotStatusPayload() {
   } catch (_) {}
 
   return {
-    message:           active ? 'Bot is running!' : 'Bot is offline',
+    message:           active ? 'Bot is running!' : (isReconnecting ? 'Reconnecting...' : 'Bot is offline'),
+    isReconnecting:    isReconnecting,
     onlinePlayersCount: active ? onlineCount : 0,
     playerDetails:     active ? playerDetails : [],
     gameMode:          active && bot.game ? bot.game.gameMode : 'N/A',
@@ -1542,22 +1549,25 @@ async function startBot() {
     const msg = err.message || String(err);
     console.error('❌ Bot error:', msg);
 
-    // Guard: if already fully reset, nothing to do
-    // NOTE: do NOT guard on (!isBotOnline && !botReady) here because errors
-    // during the connecting phase (before spawn) also have both as false —
-    // skipping those means we never schedule a reconnect and hang forever.
     if (!bot) return;
 
-    // Best-effort time unfreeze synchronously (error handler can't be async)
+    // Guard against double-fire with 'end' event which fires right after error.
+    // Use a flag so only the first handler (error) does the cleanup + reconnect.
+    if (isReconnecting) {
+      console.log('⚠️  Already reconnecting — ignoring duplicate event');
+      return;
+    }
+
+    // Best-effort time unfreeze (error handler can't be async)
     if (isTimeFrozen && bot) {
       try { bot.chat('/tick unfreeze'); } catch (_) {}
       isTimeFrozen = false;
       console.log('✅ Time unfrozen on error');
     }
 
-    botReady    = false;
-    isBotOnline = false;
-    resetBotState();
+    isReconnecting = true;
+    botReady       = false;
+    isBotOnline    = false;
     clearAllHandles();
     consecutiveFailures++;
 
@@ -1572,19 +1582,19 @@ async function startBot() {
       msg.includes('Unexpected buffer end');
 
     if (isKeepaliveTimeout) {
-      console.log('⚠️  Keepalive timeout — waiting 20s before reconnect (high latency)');
-      sendDiscordEmbed('Keepalive Timeout', 'High latency to Aternos — reconnecting in 20s', WARNING_COLOR);
+      console.log('⚠️  Keepalive timeout — waiting 20s before reconnect');
+      sendDiscordEmbed('Keepalive Timeout', 'High latency — reconnecting in 20s', WARNING_COLOR);
       if (AUTO_REJOIN) {
-        reconnectHandle = setTimeout(() => startBot().catch(e => {
-          console.error('❌ startBot error:', e.message);
-        }), 20000);
+        reconnectHandle = setTimeout(() => {
+          isReconnecting = false;
+          startBot().catch(e => console.error('❌ startBot error:', e.message));
+        }, 20000);
       }
     } else if (isNetworkError) {
       sendDiscordEmbed('Network Error', msg, WARNING_COLOR);
       if (AUTO_REJOIN) scheduleReconnect();
     } else {
       sendDiscordEmbed('Bot Error', msg, ERROR_COLOR);
-      // Still reconnect on unknown errors — don't hang
       if (AUTO_REJOIN) scheduleReconnect();
     }
   });
@@ -1594,12 +1604,19 @@ async function startBot() {
     const r = reason || 'unknown';
     console.log(`🔌 Bot disconnected: ${r}`);
 
+    // If error handler already ran and set isReconnecting, don't double-process.
+    // Just let the already-scheduled reconnect do its job.
+    if (isReconnecting) {
+      console.log('ℹ️  Reconnect already scheduled from error handler — skipping end handler');
+      return;
+    }
+
     // Unfreeze BEFORE marking offline
     await ensureTimeUnfrozen();
 
-    botReady    = false;
-    isBotOnline = false;
-    resetBotState();
+    isReconnecting = true;
+    botReady       = false;
+    isBotOnline    = false;
     clearAllHandles();
     consecutiveFailures++;
 
@@ -1956,24 +1973,6 @@ async function boot() {
   console.log(`  Mode:    Spectator-only movement engine`);
   console.log(`  PID:     ${process.pid}`);
   console.log('='.repeat(60));
-
-  // ---- KILL OLD INSTANCE (Render zero-downtime deploy protection) ----
-  // When Render deploys a new version, the old instance keeps running
-  // alongside the new one until health checks pass. Both try to connect
-  // the bot simultaneously. We hit our own public URL's /shutdown endpoint
-  // to gracefully stop the old instance before we start.
-  const publicUrl = process.env.RENDER_EXTERNAL_URL;
-  if (publicUrl) {
-    try {
-      console.log(`🔄 Signalling old instance to shut down...`);
-      await axios.post(`${publicUrl}/api/shutdown-old`, {}, { timeout: 5000 });
-      console.log(`✅ Old instance notified — waiting 3s for it to release resources`);
-      await sleep(3000);
-    } catch (_) {
-      // Old instance might already be gone — that's fine
-      console.log(`ℹ️  No old instance found or already gone`);
-    }
-  }
 
   // Start web server first so Render health check passes
   await new Promise(resolve => {
