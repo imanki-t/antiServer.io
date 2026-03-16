@@ -1395,9 +1395,6 @@ async function startBot() {
     // handles actual dead connections via socket.setKeepAlive below.
     checkTimeoutInterval: null,
     closeTimeout:         null,
-    // Disable physics during 1.21 login/configuration phase to prevent
-    // server dropping connection before spawn fires (GitHub issue #3776)
-    physicsEnabled:       false,
     hideErrors:           false,
     chatLengthLimit:      256,
     auth:                 'offline',
@@ -1454,102 +1451,48 @@ async function startBot() {
     clearTimeout(spawnTimeoutHandle);
     spawnTimeoutHandle = null;
 
-    console.log(`🔄 Spawn event fired — validating real game state...`);
+    console.log('✅ Bot spawned on ' + currentServerHost + ':' + currentServerPort);
 
-    // Re-enable physics now that configuration phase is complete
-    // Small delay per GitHub issue #3776 recommendation
-    setTimeout(() => {
-      if (bot && !bot._ended) bot.physicsEnabled = true;
-    }, 2000);
-
-    // ----------------------------------------------------------------
-    // POST-SPAWN VALIDATION
-    // Aternos's infrastructure proxy accepts TCP connections even when
-    // the Minecraft server is offline. It sends enough packets to fire
-    // mineflayer's 'spawn' event before kicking the bot. Without this
-    // check, isBotOnline gets set to true from a fake proxy spawn.
-    //
-    // We wait 4 seconds and then verify ALL of:
-    //  1. Bot object still exists and isn't ended
-    //  2. bot.entity exists (means we have a real position)
-    //  3. bot.entity.position is not 0,0,0 (proxy default)
-    //  4. bot.game exists with a valid gameMode
-    //  5. bot.players object exists (real server populates this)
-    // ----------------------------------------------------------------
-    await sleep(4000);
-
-    // Check bot is still alive after the wait
-    if (!bot || bot._ended) {
-      console.log('⚠️  Bot ended during post-spawn validation — was a proxy fake spawn');
-      return;
-    }
-
-    // Validate entity
-    const hasEntity = bot.entity &&
-      bot.entity.position &&
-      !(bot.entity.position.x === 0 && bot.entity.position.y === 0 && bot.entity.position.z === 0);
-
-    // Validate game state
-    const hasGame = bot.game && bot.game.gameMode !== undefined && bot.game.gameMode !== null;
-
-    // Validate players list (real server always has at least the bot itself)
-    const hasPlayers = bot.players && Object.keys(bot.players).length > 0;
-
-    if (!hasEntity || !hasGame || !hasPlayers) {
-      console.log(`⚠️  Post-spawn validation FAILED — Aternos proxy fake spawn detected`);
-      console.log(`    entity:${!!hasEntity} game:${!!hasGame} players:${!!hasPlayers}`);
-      console.log(`    This means the Minecraft server is still offline/starting`);
-
-      // Don't reconnect instantly — give Aternos server time to actually start
-      consecutiveFailures++;
-      try { bot.quit('Server not ready'); } catch (_) {}
-      if (AUTO_REJOIN && !isShuttingDown) {
-        const delay = 15000 + Math.random() * 10000; // 15-25s
-        console.log(`⏳ Waiting ${Math.floor(delay / 1000)}s for server to fully start...`);
-        reconnectHandle = setTimeout(() => startBot().catch(e => {
-          console.error('❌ startBot error:', e.message);
-        }), delay);
-      }
-      return;
-    }
-
-    console.log(`✅ Post-spawn validation PASSED — bot is genuinely online`);
-    console.log(`   Position: ${Math.floor(bot.entity.position.x)},${Math.floor(bot.entity.position.y)},${Math.floor(bot.entity.position.z)} | Mode: ${bot.game.gameMode}`);
-
-    // NOW it's safe to mark as online
+    // Mark online immediately.
+    // If this was a proxy fake spawn, 'end' fires within seconds
+    // and the reconnect logic handles it cleanly from there.
     isBotOnline         = true;
+    botReady            = true;
     botStartTime        = Date.now();
     lastOnlineTime      = Date.now();
     consecutiveFailures = 0;
 
-    // Keep TCP alive
+    // Keep TCP alive at OS level
     if (bot._client && bot._client.socket) {
       bot._client.socket.setKeepAlive(true, 30000);
       bot._client.socket.setTimeout(0);
     }
 
-    // Detect game mode
+    // Wait briefly for game mode packet to arrive
+    await sleep(2000);
+    if (!bot || bot._ended) return;
+
     updateSpectatorMode();
 
-    // Listen for game mode changes via player_info packet
+    // Listen for game mode changes
     if (bot._client) {
       bot._client.on('player_info', (packet) => {
         if (!packet || !packet.data) return;
         packet.data.forEach(entry => {
-          if (entry.uuid === bot.uuid) {
+          if (bot && entry.uuid === bot.uuid) {
             const gmMap = { 0: 'survival', 1: 'creative', 2: 'adventure', 3: 'spectator' };
             const gm    = gmMap[entry.gamemode];
             if (gm) {
-              bot.game = bot.game || {};
+              bot.game          = bot.game || {};
               bot.game.gameMode = gm;
               const wasSpectator = isInSpectatorMode;
               updateSpectatorMode();
               if (!wasSpectator && isInSpectatorMode) {
-                console.log('🎮 Game mode switched to SPECTATOR — starting movement engine');
+                console.log('🎮 Switched to SPECTATOR — starting movement engine');
                 startHeartbeat();
                 if (!actionSchedulerHandle) scheduleNextAction();
               } else if (wasSpectator && !isInSpectatorMode) {
-                console.log('⚠️  No longer in spectator — movement engine paused');
+                console.log('⚠️  Left spectator — pausing movement engine');
                 if (bot) bot.clearControlStates();
                 if (actionSchedulerHandle) {
                   clearTimeout(actionSchedulerHandle);
@@ -1561,13 +1504,12 @@ async function startBot() {
         });
       });
 
-      // Listen for game_state_change (game mode updates)
       bot._client.on('game_state_change', (packet) => {
         if (packet.reason === 3) {
           const gmMap = { 0: 'survival', 1: 'creative', 2: 'adventure', 3: 'spectator' };
           const gm    = gmMap[packet.gameMode];
           if (gm) {
-            bot.game = bot.game || {};
+            bot.game          = bot.game || {};
             bot.game.gameMode = gm;
             updateSpectatorMode();
           }
@@ -1575,46 +1517,42 @@ async function startBot() {
       });
     }
 
-    // Mark as truly ready
-    botReady = true;
+    const modeStr = bot.game?.gameMode || 'unknown';
+    console.log('🎮 Game mode: ' + modeStr);
 
     if (!isInSpectatorMode) {
-      console.log('⚠️  Bot online but NOT in spectator mode — waiting for mode to be set');
+      console.log('⚠️  Not in spectator yet — movement engine will start once mode confirmed');
     }
 
     sendDiscordEmbed(
       'Bot Connected',
-      `**${BOT_USERNAME}** joined ${BOT_HOST} (v${BOT_VERSION})\nMode: ${bot.game?.gameMode || 'unknown'}`,
+      '**' + BOT_USERNAME + '** joined **' + BOT_HOST + '** (v' + BOT_VERSION + ')\nMode: ' + modeStr,
       SUCCESS_COLOR,
     );
 
     setupActivityCheck();
 
-    // Start movement engine if already in spectator
     if (isInSpectatorMode) {
-      console.log('🎮 Already in spectator mode — starting movement engine');
+      console.log('🎮 Starting movement engine in spectator mode');
       await sleep(500);
       startHeartbeat();
       scheduleNextAction();
     }
 
-    // Send stats after 10s
-    setTimeout(() => {
-      if (canAct()) sendBotStats();
-    }, 10000);
-
-    setTimeout(() => {
-      if (canAct()) checkPlayerCount();
-    }, 3000);
+    setTimeout(() => { if (canAct()) sendBotStats(); },    10000);
+    setTimeout(() => { if (canAct()) checkPlayerCount(); }, 3000);
   });
 
   // ---- ERROR ----
   bot.on('error', (err) => {
-    // Guard: don't double-process if end fires right after
-    if (!isBotOnline && !botReady) return;
-
     const msg = err.message || String(err);
     console.error('❌ Bot error:', msg);
+
+    // Guard: if already fully reset, nothing to do
+    // NOTE: do NOT guard on (!isBotOnline && !botReady) here because errors
+    // during the connecting phase (before spawn) also have both as false —
+    // skipping those means we never schedule a reconnect and hang forever.
+    if (!bot) return;
 
     // Best-effort time unfreeze synchronously (error handler can't be async)
     if (isTimeFrozen && bot) {
@@ -1652,21 +1590,19 @@ async function startBot() {
       if (AUTO_REJOIN) scheduleReconnect();
     } else {
       sendDiscordEmbed('Bot Error', msg, ERROR_COLOR);
+      // Still reconnect on unknown errors — don't hang
+      if (AUTO_REJOIN) scheduleReconnect();
     }
   });
 
   // ---- END ----
   bot.on('end', async (reason) => {
-    // Guard: if already reset (e.g. error fired first), don't double-process
-    if (!isBotOnline && !botReady) return;
-
     const r = reason || 'unknown';
     console.log(`🔌 Bot disconnected: ${r}`);
 
-    // Unfreeze BEFORE marking offline — ensureTimeUnfrozen needs bot alive
+    // Unfreeze BEFORE marking offline
     await ensureTimeUnfrozen();
 
-    // Now reset all state
     botReady    = false;
     isBotOnline = false;
     resetBotState();
@@ -1680,9 +1616,6 @@ async function startBot() {
 
   // ---- KICKED ----
   bot.on('kicked', async (reason) => {
-    // Guard against double-fire with end event
-    if (!isBotOnline && !botReady) return;
-
     const reasonStr = typeof reason === 'object'
       ? JSON.stringify(reason)
       : String(reason);
