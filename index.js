@@ -1412,27 +1412,26 @@ async function startBot() {
     return;
   }
 
-  // ---- PATCH KEEPALIVE — remove minecraft-protocol's built-in 30s timeout ----
-  // keepalive.js does: options.checkTimeoutInterval || 30000
-  // So passing null/0/false still uses 30s. The ONLY way to disable it is to
-  // replace the keep_alive listener entirely after bot creation.
-  // We still respond to every keepalive packet (required or server kicks us),
-  // but we never set the watchdog timer that causes "timed out after 30000ms".
-  if (bot._client) {
-    bot._client.removeAllListeners('keep_alive');
-    bot._client.on('keep_alive', (packet) => {
-      try {
-        bot._client.write('keep_alive', { keepAliveId: packet.keepAliveId });
-      } catch (_) {}
-    });
-    console.log('✅ Keepalive timeout patched — responding to server keepalives without timeout');
-  }
-
   // ---- LOGIN EVENT ----
-  // Just log that TCP connection is established - no timeout needed.
-  // If the server is genuinely dead, the OS TCP stack will fire 'end'.
   bot.once('login', () => {
     console.log('🔗 Login established — waiting for world to load...');
+
+    // ---- PATCH KEEPALIVE ----
+    // Must be done here inside 'login' — this is when minecraft-protocol
+    // has fully registered its keep_alive listener. Patching before this
+    // (right after createBot) does nothing because the listener doesn't
+    // exist yet and gets re-added during the handshake.
+    // We remove the built-in listener and replace with one that responds
+    // to keepalives but has NO timeout — permanently fixes "timed out after 30000ms".
+    if (bot._client) {
+      bot._client.removeAllListeners('keep_alive');
+      bot._client.on('keep_alive', (packet) => {
+        try {
+          bot._client.write('keep_alive', { keepAliveId: packet.keepAliveId });
+        } catch (_) {}
+      });
+      console.log('✅ Keepalive timeout patched');
+    }
   });
 
   // No pre-login or post-login timeouts — null everywhere.
