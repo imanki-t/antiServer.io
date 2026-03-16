@@ -307,7 +307,7 @@ function updateBehaviorPhase() {
 // ⏰ TIME FREEZE / UNFREEZE
 // ============================================================================
 async function freezeTime() {
-  if (!canAct() || isTimeFrozen) return;
+  if (!AUTO_TIME_FREEZE || !canAct() || isTimeFrozen) return;
   try {
     bot.chat('/tick freeze');
     isTimeFrozen = true;
