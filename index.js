@@ -1332,20 +1332,18 @@ async function getBotStatusPayload() {
 
 // ============================================================================
 // ============================================================================
-// 🔍 DNS SRV RESOLVER
-// Aternos dynamically starts servers on different hosts every time.
-// SRV record returns: name (backend host) + port.
-// We resolve BOTH via Google/Cloudflare DNS directly to bypass OS cache.
-// Then connect to the fresh IP directly — Aternos routes by port, not hostname.
+// 🔍 DNS SRV PORT RESOLVER
+// Gets fresh port from Aternos SRV record via public DNS.
+// IMPORTANT: Always connect using the original HOSTNAME, never raw IP.
+// Aternos's proxy reads the hostname from the Minecraft handshake packet
+// to route the connection to the correct server. Connecting via raw IP
+// sends the IP in the handshake instead — Aternos can't match it and
+// drops the connection (ETIMEDOUT).
 // ============================================================================
 async function resolveServerAddress(host) {
-  const srvName = `_minecraft._tcp.${host}`;
+  const srvName  = `_minecraft._tcp.${host}`;
   const publicDns = ['8.8.8.8', '1.1.1.1', '8.8.4.4'];
 
-  let srvTarget = null;
-  let srvPort   = BOT_PORT;
-
-  // Step 1: Get SRV record (name + port) via fresh public DNS
   for (const resolver of publicDns) {
     try {
       const freshDns = new (require('dns').Resolver)();
@@ -1355,45 +1353,18 @@ async function resolveServerAddress(host) {
       });
       if (records && records.length > 0) {
         records.sort((a, b) => a.priority - b.priority);
-        srvTarget = records[0].name;
-        srvPort   = records[0].port;
-        console.log(`🔍 SRV via ${resolver}: ${srvName} → ${srvTarget}:${srvPort}`);
-        break;
+        const port = records[0].port;
+        console.log(`🔍 SRV via ${resolver}: ${srvName} → port ${port}`);
+        // Always use original hostname for connection — Aternos proxy needs it
+        return { connectHost: host, connectPort: port, displayHost: host };
       }
     } catch (err) {
       console.log(`⚠️  SRV via ${resolver} failed: ${err.message}`);
     }
   }
 
-  if (!srvTarget) {
-    console.log(`⚠️  SRV failed — using config values ${host}:${BOT_PORT}`);
-    return { connectHost: host, connectPort: BOT_PORT, displayHost: host };
-  }
-
-  // Step 2: Resolve the SRV target hostname to a fresh IP via public DNS
-  // This bypasses the OS/Render DNS cache which returns stale Aternos IPs
-  for (const resolver of publicDns) {
-    try {
-      const freshDns = new (require('dns').Resolver)();
-      freshDns.setServers([resolver]);
-      const addresses = await new Promise((resolve, reject) => {
-        freshDns.resolve4(srvTarget, (err, addrs) => err ? reject(err) : resolve(addrs));
-      });
-      if (addresses && addresses.length > 0) {
-        const ip = addresses[0];
-        console.log(`🔍 A record via ${resolver}: ${srvTarget} → ${ip}`);
-        console.log(`🎯 Final: connect to ${ip}:${srvPort} (display: ${host})`);
-        // Connect to the fresh IP directly, show original hostname on dashboard
-        return { connectHost: ip, connectPort: srvPort, displayHost: host };
-      }
-    } catch (err) {
-      console.log(`⚠️  A record via ${resolver} failed: ${err.message}`);
-    }
-  }
-
-  // Fallback: use SRV target name without IP resolution
-  console.log(`⚠️  IP resolution failed — using SRV target directly: ${srvTarget}:${srvPort}`);
-  return { connectHost: srvTarget, connectPort: srvPort, displayHost: host };
+  console.log(`⚠️  SRV failed — using config port ${BOT_PORT}`);
+  return { connectHost: host, connectPort: BOT_PORT, displayHost: host };
 }
 
 // ============================================================================
@@ -1427,7 +1398,7 @@ async function startBot() {
   console.log(`\n🚀 Connecting to ${resolved.connectHost}:${resolved.connectPort} as ${BOT_USERNAME} (${BOT_VERSION})...`);
 
   const botOptions = {
-    host:                 resolved.connectHost, // fresh IP — bypasses stale OS DNS
+    host:                 resolved.connectHost, // original hostname — Aternos proxy needs this for routing
     port:                 resolved.connectPort,
     username:             BOT_USERNAME,
     version:              BOT_VERSION,
