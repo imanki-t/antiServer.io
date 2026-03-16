@@ -18,7 +18,7 @@
     "mongoUri": ""
   },
   "intervals": {
-    "reconnectDelays": [10000, 15000, 20000],
+    "reconnectDelays": [3000, 4000, 5000],
     "socketUpdate": 1000,
     "activityCheck": 5000,
     "keepAlive": 840000
