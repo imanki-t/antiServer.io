@@ -46,7 +46,7 @@
     "doon.png"
   ],
   "features": {
-    "autoTimeFreeze": true,
+    "autoTimeFreeze": false,
     "antiAFK": true,
     "autoRejoin": true,
     "selfPing": true,
