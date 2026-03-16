@@ -1403,6 +1403,11 @@ async function startBot() {
     username:             BOT_USERNAME,
     version:              BOT_VERSION,
     keepAlive:            true,
+    // Disable client-side keepalive timeout — Render→Aternos latency is
+    // unpredictable. Bot still responds to server keepalives, just won't
+    // self-disconnect if round-trip is slow. OS TCP handles dead connections.
+    checkTimeoutInterval: null,
+    closeTimeout:         null,
     hideErrors:           false,
     // physicsEnabled: false is REQUIRED for 1.21+ with proxy servers (Aternos uses proxy).
     // Without it, mineflayer sends physics packets during the configuration phase
