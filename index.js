@@ -1404,6 +1404,11 @@ async function startBot() {
     version:              BOT_VERSION,
     keepAlive:            true,
     hideErrors:           false,
+    // physicsEnabled: false is REQUIRED for 1.21+ with proxy servers (Aternos uses proxy).
+    // Without it, mineflayer sends physics packets during the configuration phase
+    // causing the server to drop the connection before spawn fires.
+    // GitHub issue: https://github.com/PrismarineJS/mineflayer/issues/3776
+    physicsEnabled:       false,
     chatLengthLimit:      256,
     auth:                 'offline',
   };
@@ -1451,6 +1456,16 @@ async function startBot() {
     }
 
     console.log('✅ Bot spawned on ' + currentServerHost + ':' + currentServerPort);
+
+    // Re-enable physics now that configuration phase is complete.
+    // Must be delayed 2000ms — re-enabling immediately can still cause
+    // the proxy to drop the connection. (GitHub issue #3776)
+    setTimeout(() => {
+      if (bot && !bot._ended) {
+        bot.physicsEnabled = true;
+        console.log('✅ Physics re-enabled');
+      }
+    }, 2000);
 
     // Mark online immediately.
     // If this was a proxy fake spawn, 'end' fires within seconds
